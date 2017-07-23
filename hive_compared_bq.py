@@ -2,6 +2,7 @@ import pyhs2
 import logging
 import threading
 import difflib
+import sys
 import webbrowser
 from collections import Counter
 from google.cloud import bigquery
@@ -26,6 +27,7 @@ number_of_most_frequent_values_to_weight = 50
 
 number_of_group_by = 100000  # 7999 is the limit if you want to manually download the data from BQ. This limit does
 #  not apply in this script because we fetch the data with the Python API instead.
+#  TODO ideally this limit would be dynamic (counting the total rows), in order to get an average of 7 lines per bucket
 
 logging.basicConfig(level=logging.DEBUG, format='[%(levelname)s]\t[%(asctime)s]  (%(threadName)-10s) %(message)s',)
 
@@ -176,10 +178,7 @@ def compare_groupby_count(hive_table, bq_table, column):
 
     def launch_hive():
         """Utility to Thread"""
-        logging.debug("Launching Hive query")
-        cur = conn.cursor()
-        cur.execute(hive_query)
-        logging.debug("Fetching Hive results")
+        cur = query_hive(hive_query)
         while cur.hasMoreRows:
             row = cur.fetchone()
             if row is not None:
@@ -232,10 +231,10 @@ def show_results_count(hive_table, bq_table, gb_column, differences, bq_biggest)
     if len(differences) == 0:
         print "No differences where found when doing a Count on the tables %s and %s and grouping by on the column " \
               "%s" % (hive_table, bq_table, gb_column)
-        return
-    # We want to return at most 4 blocks of lines corresponding to different group by values. For the sake of brevity,
+        return True  # means that we should continue executing the script
+    # We want to return at most 6 blocks of lines corresponding to different group by values. For the sake of brevity,
     # each block should not show more than 40 lines. Blocks that show rows only on BQ or only on Hive should be limited
-    # to 2 (so that we can see "context" when debugging). To also give context, we will show some few other columns.
+    # to 3 (so that we can see "context" when debugging). To also give context, we will show some few other columns.
     number_buckets_only_one_table = 0
     number_buckets_found = 0
     buckets_hive = []
@@ -247,12 +246,12 @@ def show_results_count(hive_table, bq_table, gb_column, differences, bq_biggest)
         if biggest_num + (biggest_num - total) > 40:  # "biggest_num - total" = number of lines in small dictionary
             continue
         if total == biggest_num:
-            if number_buckets_only_one_table == 2:
+            if number_buckets_only_one_table == 3:
                 continue
             else:
                 number_buckets_only_one_table += 1
                 number_buckets_found += 1
-                if number_buckets_found == 4:
+                if number_buckets_found == 6:
                     break
                 if bq_biggest:
                     buckets_bq.append(bucket)
@@ -262,7 +261,7 @@ def show_results_count(hive_table, bq_table, gb_column, differences, bq_biggest)
             buckets_bq.append(bucket)
             buckets_hive.append(bucket)
             number_buckets_found += 1
-            if number_buckets_found == 4:
+            if number_buckets_found == 6:
                 break
 
     logging.debug("Buckets for Hive: %s \t\tBuckets for BQ: %s", str(buckets_hive), str(buckets_bq))
@@ -287,7 +286,7 @@ def show_results_count(hive_table, bq_table, gb_column, differences, bq_biggest)
         while cur.hasMoreRows:
             row = cur.fetchone()
             if row is not None:
-                line = "^ " + " | ".join([str(x) for x in row]) + " $"
+                line = "^ " + " | ".join([str(col) for col in row]) + " $"
                 hive_lines.append(line)
         logging.debug("All %i Hive rows fetched", len(hive_lines))
         cur.close()
@@ -296,7 +295,7 @@ def show_results_count(hive_table, bq_table, gb_column, differences, bq_biggest)
         """Utility to Thread"""
         r = query_bq(bq_query)
         for row in r:
-            line = "^ " + " | ".join([str(x) for x in row]) + " $"
+            line = "^ " + " | ".join([str(col) for col in row]) + " $"
             bq_lines.append(line)
         logging.debug("All %i BQ rows fetched", len(bq_lines))
 
@@ -310,23 +309,109 @@ def show_results_count(hive_table, bq_table, gb_column, differences, bq_biggest)
     t_hive.join()
 
     bq_lines.sort()
-    bq_text = "\n".join(bq_lines)
     bq_file = "/tmp/count_diff_bq"
     with open(bq_file, "w") as f:
-        f.write(bq_text)
+        f.write("\n".join(bq_lines))
     hive_lines.sort()
-    hive_text = "\n".join(hive_lines)
     hive_file = "/tmp/count_diff_hive"
     with open(hive_file, "w") as f:
-        f.write(hive_text)
-    logging.debug("Sorted results of the queries are in the files %s and %s", hive_file, bq_file)
-    diff = difflib.HtmlDiff().make_file(hive_lines, bq_lines, "hive", "BigQuery", context=False, numlines=30)
+        f.write("\n".join(hive_lines))
+    diff = difflib.HtmlDiff().make_file(hive_lines, bq_lines, "Hive", "BigQuery", context=False, numlines=30)
     html_file = "/tmp/count_diff.html"
     with open(html_file, "w") as f:
         f.write(diff)
+    logging.debug("Sorted results of the queries are in the files %s and %s. HTML differences are in %s",
+                  hive_file, bq_file, html_file)
     webbrowser.open("file://" + html_file, new=2)
+    return False  # no need to execute the script further since errors have already been spotted
+
+
+def get_intermediate_checksum_sql(hive_table, bq_table, column):
+    """Build and return the queries that generate all the checksums to make the final comparison
+
+    The queries will have the following schema:
+
+WITH blocks AS (
+    SELECT MOD( hash2( column), 100000) as gb, sha1(concat( col0, col1, col2, col3, col4)) as block_1,
+      sha1(concat( col5, col6, col7, col8, col9)) as block_2, ... as block_N FROM table
+),
+full_lines AS (
+    SELECT gb, sha1(concat( block_1, |, block_2...) as row_sha, block_1, block_2 ... FROM blocks
+)
+SELECT gb, sha1(concat(list<row_sha>)) as sline, sha1(concat(list<block_1>)) as sblock_1,
+    sha1(concat(list<block_2>)) as sblock_2 ... as sblock_N FROM GROUP BY gb
+
+    Args:
+        hive_table (string): Full name of the Hive table
+        bq_table (string): Full name of the BigQuery table
+        column (string): The column used to Group By on
+
+    Returns:
+        tuple: the Hive query , the BQ query
+    """
+
+    column_blocks = []
+    block_size = 5  # 5 columns means that when we want to debug we have enough context. But it small enough to avoid
+    # being charged too much by Google when querying on it
+    for idx, col in enumerate(ddlColumns):
+        block_id = idx / block_size
+        if idx % block_size == 0:
+            column_blocks.append([])
+        column_blocks[block_id].append({"name": col["name"], "type": col["type"]})
+    number_of_blocks = len(column_blocks)
+    logging.debug("%i column_blocks (with a size of %i columns) have been considered: %s", number_of_blocks, block_size,
+                  str(column_blocks))
+
+    # Generate the concatenations for the column_blocks
+    hive_basic_shas = ""
+    bq_basic_shas = ""
+    for idx, block in enumerate(column_blocks):  # TODO use enumerate everywhere
+        hive_basic_shas += "base64( unhex( SHA1( concat( "
+        bq_basic_shas += "TO_BASE64( sha1( concat( "
+        for col in block:
+            name = col["name"]
+            hive_value_name = name
+            bq_value_name = name
+            if col["type"] == 'date':
+                hive_value_name = "cast( %s as STRING)" % name
+            elif "decimal" in col["type"]:  # aligning formatting of Decimal types in Hive with Float in BQ
+                hive_value_name = 'regexp_replace( %s, "\\.0$", "")' % name
+            if not col["type"] == 'string':
+                bq_value_name = "cast( %s as STRING)" % name
+            hive_basic_shas += "CASE WHEN %s IS NULL THEN 'n_%s' ELSE %s END, '|'," % (name, name[:2], hive_value_name)
+            bq_basic_shas += "CASE WHEN %s IS NULL THEN 'n_%s' ELSE %s END, '|'," % (name, name[:2], bq_value_name)
+        hive_basic_shas = hive_basic_shas[:-6] + ")))) as block_%i,\n" % idx
+        bq_basic_shas = bq_basic_shas[:-6] + "))) as block_%i,\n" % idx
+    hive_basic_shas = hive_basic_shas[:-2]
+    bq_basic_shas = bq_basic_shas[:-2]
+
+    hive_query = "WITH blocks AS (\nSELECT hash(%s) %% %i as gb,\n%s\nFROM %s\n),\n" \
+                 % (column, number_of_group_by, hive_basic_shas, hive_table)  # 1st CTE with the basic block shas
+    list_blocks = ", ".join(["block_%i" % i for i in range(number_of_blocks)])
+    hive_query += "full_lines AS(\nSELECT gb, base64( unhex( SHA1( concat( %s)))) as row_sha, %s FROM blocks\n)\n" % \
+                  (list_blocks, list_blocks)  # 2nd CTE to get all the info of a row
+    hive_list_shas = ", ".join(["base64( unhex( SHA1( concat_ws( '|', collect_list( block_%i))))) as block_%i_gb " %
+                                (i, i) for i in range(number_of_blocks)])
+    hive_query += "SELECT gb, base64( unhex( SHA1( concat_ws( '|', collect_list( row_sha))))) as row_sha_gb, %s FROM " \
+                  "full_lines GROUP BY gb" % hive_list_shas  # final query where all the shas are grouped by row-blocks
+    logging.debug("##### Final Hive query is:\n%s\n", hive_query)
+
+    bq_query = hash2_js_udf + "WITH blocks AS (\nSELECT MOD( hash2(%s), %i) as gb,\n%s\nFROM %s\n),\n" \
+                              % (column, number_of_group_by, bq_basic_shas, bq_table)  # 1st CTE
+    bq_query += "full_lines AS(\nSELECT gb, TO_BASE64( sha1( concat( %s))) as row_sha, %s FROM blocks\n)\n"\
+                % (list_blocks, list_blocks)  # 2nd CTE to get all the info of a row
+    bq_list_shas = ", ".join(["SHA1( STRING_AGG( block_%i, '|')) as block_%i_gb "
+                              % (i, i) for i in range(number_of_blocks)])
+    bq_query += "SELECT gb, SHA1( STRING_AGG( row_sha, '|')) as row_sha_gb, %s FROM full_lines GROUP BY gb" \
+                % bq_list_shas  # final query where all the shas are grouped by row-blocks
+    logging.debug("##### Final BigQuery query is:\n%s\n", bq_query)
 
 get_table_ddl(fullHiveTable)
 group_by_column = find_groupby_column(fullHiveTable)
+'''
 gb_differences, bq_biggest_dic = compare_groupby_count(fullHiveTable, fullBqTable, group_by_column)
-show_results_count(fullHiveTable, fullBqTable, group_by_column, gb_differences, bq_biggest_dic)
+do_we_continue = show_results_count(fullHiveTable, fullBqTable, group_by_column, gb_differences, bq_biggest_dic)
+if not do_we_continue:
+    sys.exit(1)
+'''
+get_intermediate_checksum_sql(fullHiveTable, fullBqTable, group_by_column)
