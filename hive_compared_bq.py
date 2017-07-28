@@ -5,189 +5,353 @@ import difflib
 import sys
 import time
 import webbrowser
+from abc import ABCMeta, abstractmethod
 from collections import Counter
 from google.cloud import bigquery
 
-cluster = "b"
-#  myDatabase = 'ldebruijn'
-myDatabase = 'sluangsay'
-bq_database = 'bidwh2'
-#  myTable = 'PPP_retail_promotion_reference_group'
-#  myTable = 'PPP_retail_promotion'
-myTable = 'hive_compared_bq_table3'
+ABC = ABCMeta('ABC', (object,), {}) # compatible with Python 2 *and* 3
 
-# 10 000 rows should be good enough to use as a sample
-#  (Google uses some sample of 1000 or 3000 rows)
-#  Estimation of memory for the Counters: 10000 * 10 * ( 10 * 4 + 4) * 4 = 16.8 MB
-#  (based on estimation : rows * columns * ( size string + int) * overhead Counter )
-sample_rows_number = 10000
-sample_column_number = 10
-max_percent_most_frequent_value_in_column = 1  # if in one sample a column has a value whose frequency is highest than
-#  this percentage, then this column is discarded
-number_of_most_frequent_values_to_weight = 50
 
-number_of_group_by = 100000  # 7999 is the limit if you want to manually download the data from BQ. This limit does
-#  not apply in this script because we fetch the data with the Python API instead.
-#  TODO ideally this limit would be dynamic (counting the total rows), in order to get an average of 7 lines per bucket
-block_size = 5  # 5 columns means that when we want to debug we have enough context. But it small enough to avoid
-# being charged too much by Google when querying on it
+class _Table(ABC):
+    """"Represent an abstract table that contains database connection and the related SQL executions"""
+    # TODO more description
+
+    __metaclass__ = ABCMeta
+
+    def __init__(self, database, table):
+        self.database = database
+        self.table = table
+        self.full_name = database + '.' + table
+        self.connection = self._create_connection()
+        self._ddl_columns = []  # array instead of dictionary because we want to maintain the order of the columns
+        self._ddl_partitions = []  # take care, those rows also appear in the columns array
+        self._group_by_column = None  # the column that is used to "bucket" the rows
+
+    @abstractmethod
+    def get_type(self):
+        """Return the (string) type of the database (Hive, BigQuery)"""
+        pass
+
+    @abstractmethod
+    def _create_connection(self):
+        """Connect to the table and return the connection object that we will use to launch queries"""
+        pass
+
+    @abstractmethod
+    def get_ddl_column(self):
+        """ Return the columns of this table
+
+        The list of the column is an attribute of the class. If it already exists, then it is directly returns.
+        Otherwise, a connection is made to the database to get the schema of the table, and at the same time the
+        attribute (list) partition is also filled.
+
+        :rtype: list of dict
+        :returns: list of {"name", "type"} dictionaries that represent the columns of this table
+        """
+        pass
+
+    @abstractmethod
+    def get_groupby_column(self):
+        # TODO doc
+        pass
+
+    @abstractmethod
+    def create_sql_groupby_count(self):
+        # TODO doc
+        pass
+
+    @abstractmethod
+    def launch_query_dict_result(self, query, result_dic):
+        # TODO doc
+        pass
+
+    def get_sample_query(self):
+        """ Build a SQL query that allows to get some sample lines with limited amount of columns"""
+        # TODO doc again
+        query = "SELECT"
+        selected_columns = self.get_ddl_column()[:tc.sample_column_number]
+        for col in selected_columns:
+            query += " %s," % col["name"]  # for the last column we'll remove that trailing ","
+        query = query[:-1] + " FROM %s LIMIT %i" % (self.full_name, tc.sample_column_number)
+        return query, selected_columns
+
+
+class THive(_Table):
+    """Hive implementation of the _Table object"""
+
+    def __init__(self, database, table, cluster):
+        self.server = 'shd-hdp-' + cluster + '-master-003.bolcom.net'
+        _Table.__init__(self, database, table)
+        self.jarPath = 'hdfs://hdp-' + cluster + '/user/sluangsay/lib/sha1.jar'
+
+    def get_type(self):
+        return "hive"
+
+    def _create_connection(self):  # TODO maybe this underlying object should be private?
+        return pyhs2.connect(host=self.server, port=10000, authMechanism="KERBEROS", database=self.database)
+
+    def get_ddl_column(self):
+        if len(self._ddl_columns) > 0:
+            return self._ddl_columns
+
+        # TODO doc again
+        is_col_def = True
+        cur = self.connection.cursor()
+        cur.execute("describe " + self.full_name)
+        while cur.hasMoreRows:
+            row = cur.fetchone()  # TODO check if we should not do fetchall instead, or other fetch batch
+            if row is None:
+                continue
+            col_name = row[0]
+            col_type = row[1]
+
+            if col_name == "" or col_name == "None":
+                continue
+            if col_name.startswith('#'):
+                if "Partition Information" in col_name:
+                    is_col_def = False
+                continue
+
+            my_dic = {"name": col_name, "type": col_type}
+            if is_col_def:
+                self._ddl_columns.append(my_dic)
+            else:
+                self._ddl_partitions.append(my_dic)
+        cur.close()
+        return self._ddl_columns
+
+    def get_groupby_column(self):
+        """Use a sample to return a column that seems enough spread to do interesting GROUP BY on it"""
+        # TODO doc again
+        if self._group_by_column is not None:
+            return self._group_by_column
+
+        query, selected_columns = self.get_sample_query()
+
+        #  Get a sample from the table and fill Counters to each column
+        logging.info("Analyzing the columns %s with a sample of %i values", str([x["name"] for x in selected_columns]),
+                     tc.sample_column_number)
+        for col in selected_columns:
+            col["Counter"] = Counter()
+        cur = self.connection.cursor()
+        cur.execute(query)
+        while cur.hasMoreRows:
+            fetched = cur.fetchone()
+            if fetched is not None:
+                for idx, col in enumerate(selected_columns):
+                    value_column = fetched[idx]
+                    col["Counter"][value_column] += 1  # TODO what happens with NULL?
+        cur.close()
+
+        #  Look at the statistics to estimate which column is the best to do a GROUP BY
+        max_frequent_number = tc.sample_rows_number * tc.max_percent_most_frequent_value_in_column / 100
+        minimum_weight = tc.sample_rows_number  # TODO put infinite for clarity of code
+        highest_first = max_frequent_number
+        column_with_minimum_weight = None
+        for col in selected_columns:
+            highest = col["Counter"].most_common(1)[0]
+            if highest[1] > max_frequent_number:
+                logging.debug(
+                    "Discarding column '%s' because '%s' was found in sample %i times (higher than limit of %i)",
+                    col["name"], highest[0], highest[1], max_frequent_number)
+                continue
+            # The biggest value is not too high, so let's see how big are the 50 biggest values
+            weight_of_most_frequent_values = sum([x[1] for x in col["Counter"]
+                                                 .most_common(tc.number_of_most_frequent_values_to_weight)])
+            logging.debug("%s %s", col["name"], weight_of_most_frequent_values)
+            if weight_of_most_frequent_values < minimum_weight:
+                column_with_minimum_weight = col["name"]
+                minimum_weight = weight_of_most_frequent_values
+                highest_first = highest[1]
+        logging.info("Best column to do a GROUP BY is %s (%i / %i)", column_with_minimum_weight, highest_first,
+                     minimum_weight)
+
+        self._group_by_column = column_with_minimum_weight  # TODO directly use the correct object above
+        return self._group_by_column
+
+    def create_sql_groupby_count(self):
+        # TODO doc again
+        query = "SELECT hash( %s) %% %s AS gb, count(*) AS count FROM %s GROUP BY hash(%s) %% %i"\
+                % (self.get_groupby_column(), tc.number_of_group_by, self.full_name, self.get_groupby_column(),
+                   tc.number_of_group_by)
+        logging.debug("Hive query is: %s", query)
+
+        return query
+
+    def query(self, query):
+        """Execute the received query in Hive and return the cursor which is ready to be fetched and MUST be closed after
+
+        :type query: str
+        :param query: query to execute in Hive
+
+        :rtype: :class:`pyhs2.cursor.Cursor`
+        :returns: the cursor for this query
+        """
+
+        logging.debug("Launching Hive query")
+        cur = self.connection.cursor()
+        cur.execute(query)
+        logging.debug("Fetching Hive results")
+        return cur
+
+    def launch_query_dict_result(self, query, result_dic):
+        # TODO doc
+        cur = self.query(query)
+        while cur.hasMoreRows:
+            row = cur.fetchone()
+            if row is not None:
+                result_dic[row[0]] = row[1]
+        logging.debug("All %i Hive rows fetched", len(result_dic))
+        cur.close()
+
+
+class TBigQuery(_Table):
+    """BigQuery implementation of the _Table object"""
+
+    hash2_js_udf = '''create temp function hash2(v STRING)
+    returns INT64
+    LANGUAGE js AS """
+      var myHash = 0
+      for (let c of v){
+        myHash = myHash * 31 + c.charCodeAt(0)
+        if (myHash >= 4294967296){ // because in Hive hash() is computed on integers range
+          myHash = myHash % 4294967296
+        }
+      }
+      if (myHash >= 2147483648){
+        myHash = myHash - 4294967296
+      }
+      return myHash
+    """;
+    '''
+
+    def get_type(self):
+        return "bigQuery"
+
+    def _create_connection(self):  # TODO maybe this underlying object should be private?
+        return bigquery.Client()
+
+    def get_ddl_column(self):
+        # TODO doc
+        if len(self._ddl_columns) > 0:
+            return self._ddl_columns
+        else:
+            raise AttributeError("DDL for this BigQuery table has not been given yet")
+
+    def get_groupby_column(self):
+        pass # not implemented yet
+
+    def create_sql_groupby_count(self):
+        # TODO doc
+        query = self.hash2_js_udf + "SELECT MOD( hash2(%s), %i) as gb, count(*) as count FROM %s GROUP BY gb ORDER BY " \
+                                    "gb" % (self.get_groupby_column(), tc.number_of_group_by, self.full_name)
+        logging.debug("BigQuery query is: %s", query)
+        return query
+
+    def query(self, query):
+        """Execute the received query in BigQuery and return an iterate Result object
+
+        :type query: str
+        :param query: query to execute in BigQuery
+
+        :rtype: list of rows
+        :returns: the QueryResults for this query
+        """
+        logging.debug("Launching BigQuery query")
+        q = self.connection.run_sync_query(query)
+        q.timeout_ms = 60000  # 1 minute to execute the query in BQ should be more than enough
+        q.use_legacy_sql = False  # TODO use maxResults https://cloud.google.com/bigquery/docs/reference/rest/v2/jobs/query?
+        q.run()
+        logging.debug("Fetching BigQuery results")
+        return q.fetch_data()
+
+
+class TableComparator(object):
+    """Represent the general configuration of the program (tables names, number of rows to scan...) """
+
+    def __init__(self):
+        table = 'hive_compared_bq_table3'
+        self.tsrc = THive('sluangsay', table, 'b')
+        self.tdst = TBigQuery('bidwh2', table)
+        #  myDatabase = 'ldebruijn'
+        #  myTable = 'PPP_retail_promotion_reference_group'
+        #  myTable = 'PPP_retail_promotion'
+
+        # 10 000 rows should be good enough to use as a sample
+        #  (Google uses some sample of 1000 or 3000 rows)
+        #  Estimation of memory for the Counters: 10000 * 10 * ( 10 * 4 + 4) * 4 = 16.8 MB
+        #  (based on estimation : rows * columns * ( size string + int) * overhead Counter )
+        self.sample_rows_number = 10000
+        self.sample_column_number = 10
+        self.max_percent_most_frequent_value_in_column = 1  # if in one sample a column has a value whose frequency is
+        # highest than this percentage, then this column is discarded
+        self.number_of_most_frequent_values_to_weight = 50
+
+        self.number_of_group_by = 100000  # 7999 is the limit if you want to manually download the data from BQ. This
+        # limit does not apply in this script because we fetch the data with the Python API instead.
+        #  TODO ideally this limit would be dynamic (counting the total rows), in order to get an average of 7 lines per bucket
+        self.block_size = 5  # 5 columns means that when we want to debug we have enough context. But it small enough to
+        #  avoid being charged too much by Google when querying on it
+
+    def compare_groupby_count(self):
+        """Runs a light query on Hive and BigQuery to check if the counts match, using the ideal column estimated before
+
+        :type hive_table: str
+        :param hive_table: full name of the Hive table
+
+        :type bq_table: str
+        :param bq_table: full name of the BigQuery table
+
+        :type column: str
+        :param column: the column used to Group By on
+
+        :rtype: tuple
+        :returns: ``(summary_differences, big_small_bucket)``, where ``summary_differences`` is a list of tuples,
+        one per difference containing (groupByValue, number of differences for this bucket, count of rows for this
+        bucket for the "biggest table"); ``big_small_bucket`` is a tuple containing the table that has the biggest
+        distribution (according to the Group By column) and then the other table
+        """
+        logging.info("Executing the 'Group By' Count queries in Hive and BigQuery to do first comparison")
+        src_query = self.tsrc.create_sql_groupby_count()
+        dst_query = self.tdst.create_sql_groupby_count()
+
+        result = {"src_count_dict": {}, "dst_count_dict": {}}
+        t_src = threading.Thread(name='srcGroupBy-' + self.tsrc.get_type(), target=self.tsrc.launch_query_dict_result,
+                                 args=(src_query, result["src_count_dict"]))
+        t_dst = threading.Thread(name='dstGroupBy-' + self.tdst.get_type(), target=self.tdst.launch_query_dict_result,
+                                 args=(dst_query, result["dst_count_dict"]))
+        t_src.start()
+        t_dst.start()
+        t_src.join()
+        t_dst.join()
+
+        # #### Let's compare the count between the 2 Group By queries
+        # iterate on biggest dictionary so that we're sure to se a difference if there is one
+        logging.debug("Searching differences in Group By")
+        if len(result["src_count_dict"]) > len(result["dst_count_dict"]):
+            big_dict = result["src_count_dict"]
+            small_dict = result["dst_count_dict"]
+            big_small_bucket = (t_src, t_dst)
+        else:
+            big_dict = result["dst_count_dict"]
+            small_dict = result["src_count_dict"]
+            big_small_bucket = (t_dst, t_src)
+        differences = Counter()
+        for (k, v) in big_dict.iteritems():
+            if k not in small_dict:
+                differences[k] = -v  # we want to see the differences where we have less lines to compare
+            elif v != small_dict[k]:
+                differences[k] = -v - small_dict[k]
+        summary_differences = [(k, -v, big_dict[k]) for (k, v) in differences.most_common()]
+        if len(summary_differences) != 0:
+            logging.info("We found at least %i differences in Group By count", len(summary_differences))
+            logging.debug("Differences in Group By count are: %s", summary_differences[:300])
+        return summary_differences, big_small_bucket
+
 
 logging.basicConfig(level=logging.DEBUG, format='[%(levelname)s]\t[%(asctime)s]  (%(threadName)-10s) %(message)s',)
 
-server = 'shd-hdp-' + cluster + '-master-003.bolcom.net'
-fullHiveTable = myDatabase + "." + myTable
-fullBqTable = bq_database + "." + myTable
-jarPath = 'hdfs://hdp-' + cluster + '/user/sluangsay/lib/sha1.jar'
-
-conn = pyhs2.connect(host=server, port=10000, authMechanism="KERBEROS", database=myDatabase)
-bigquery_client = bigquery.Client()
-
-hash2_js_udf = '''create temp function hash2(v STRING)
-returns INT64
-LANGUAGE js AS """
-  var myHash = 0
-  for (let c of v){
-    myHash = myHash * 31 + c.charCodeAt(0)
-    if (myHash >= 4294967296){ // because in Hive hash() is computed on integers range
-      myHash = myHash % 4294967296
-    }
-  }
-  if (myHash >= 2147483648){
-    myHash = myHash - 4294967296
-  }
-  return myHash
-""";
-'''
-
-# TODO put this into a real object to have type check!?
-ddlColumns = []  # array instead of dictionary because we want to maintain the order of the columns
-ddlPartitions = []  # take care, those rows also appear in the columns array
-
-
-def get_table_ddl(table):
-    """ Get the DDL of the (Hive) table and store it into arrays"""
-    is_col_def = True
-    cur = conn.cursor()
-    cur.execute("describe " + table)
-    while cur.hasMoreRows:
-        row = cur.fetchone()  # TODO check if we should not do fetchall instead, or other fetch batch
-        if row is None:
-            continue
-        col_name = row[0]
-        col_type = row[1]
-
-        if col_name == "" or col_name == "None":
-            continue
-        if col_name.startswith('#'):
-            if "Partition Information" in col_name:
-                is_col_def = False
-            continue
-
-        my_dic = {"name": col_name, "type": col_type}
-        if is_col_def:
-            ddlColumns.append(my_dic)
-        else:
-            ddlPartitions.append(my_dic)
-    cur.close()
-
-
-def get_sample_query(table):
-    """ Build a SQL query that allows to get some sample lines with limited amount of columns"""
-    query = "SELECT"
-    selected_columns = ddlColumns[:sample_column_number]
-    for col in selected_columns:
-        query = query + " " + col["name"] + ","  # for the last column we'll remove that trailing ","
-    query = query[:-1] + " FROM " + table + " LIMIT " + str(sample_rows_number)
-    return query, selected_columns
-
-
-def find_groupby_column(table):
-    """Use a sample to return a column that seems enough spread to do interesting GROUP BY on it"""
-    query, selected_columns = get_sample_query(table)
-
-    #  Get a sample from the table and fill Counters to each column
-    logging.info("Analyzing the columns %s with a sample of %i values", str([x["name"] for x in selected_columns]),
-                 sample_rows_number)
-    for col in selected_columns:
-        col["Counter"] = Counter()
-    cur = conn.cursor()
-    cur.execute(query)
-    while cur.hasMoreRows:
-        fetched = cur.fetchone()
-        if fetched is not None:
-            for idx, col in enumerate(selected_columns):
-                value_column = fetched[idx]
-                col["Counter"][value_column] += 1  # TODO what happens with NULL?
-    cur.close()
-
-    #  Look at the statistics to estimate which column is the best to do a GROUP BY
-    max_frequent_number = sample_rows_number * max_percent_most_frequent_value_in_column / 100
-    minimum_weight = sample_rows_number
-    highest_first = max_frequent_number
-    column_with_minimum_weight = None
-    for col in selected_columns:
-        highest = col["Counter"].most_common(1)[0]
-        if highest[1] > max_frequent_number:
-            logging.debug("Discarding column '%s' because '%s' was found in sample %i times (higher than limit of %i)",
-                          col["name"], highest[0], highest[1], max_frequent_number)
-            continue
-        # The biggest value is not too high, so let's see how big are the 50 biggest values
-        weight_of_most_frequent_values = sum([x[1] for x in col["Counter"]
-                                             .most_common(number_of_most_frequent_values_to_weight)])
-        logging.debug("%s %s", col["name"], weight_of_most_frequent_values)
-        if weight_of_most_frequent_values < minimum_weight:
-            column_with_minimum_weight = col["name"]
-            minimum_weight = weight_of_most_frequent_values
-            highest_first = highest[1]
-    logging.info("Best column to do a GROUP BY is %s (%i / %i)", column_with_minimum_weight, highest_first,
-                 minimum_weight)
-    return column_with_minimum_weight
-
-
-def get_groupby_count_sql(hive_table, bq_table, column):
-    hive_query = "SELECT hash(" + column + ") % " + str(number_of_group_by) + " as gb, count(*) as count " \
-                 "FROM " + hive_table + " GROUP BY hash(%s) %% %i" % (column, number_of_group_by)
-    logging.debug("Hive query is: %s", hive_query)
-
-    bq_query = hash2_js_udf + "SELECT MOD( hash2(%s), %i) as gb, count(*) as count FROM %s GROUP BY gb ORDER BY gb" % \
-                              (column, number_of_group_by, bq_table)
-    logging.debug("BigQuery query is: %s", bq_query)
-    return hive_query, bq_query
-
-
-def query_bq(query):
-    """Execute the received query in BigQuery and return an iterate Result object
-
-    :type query: str
-    :param query: query to execute in BigQuery
-
-    :rtype: list of rows
-    :returns: the QueryResults for this query
-    """
-    logging.debug("Launching BigQuery query")
-    q = bigquery_client.run_sync_query(query)
-    q.timeout_ms = 60000  # 1 minute to execute the query in BQ should be more than enough
-    q.use_legacy_sql = False  # TODO use maxResults https://cloud.google.com/bigquery/docs/reference/rest/v2/jobs/query?
-    q.run()
-    logging.debug("Fetching BigQuery results")
-    return q.fetch_data()
-
-
-def query_hive(query):
-    """Execute the received query in Hive and return the cursor which is ready to be fetched and MUST be closed after
-
-    :type query: str
-    :param query: query to execute in Hive
-
-    :rtype: :class:`pyhs2.cursor.Cursor`
-    :returns: the cursor for this query
-    """
-
-    logging.debug("Launching Hive query")
-    cur = conn.cursor()
-    cur.execute(query)
-    logging.debug("Fetching Hive results")
-    return cur
+tc = TableComparator()
 
 
 def query_ctas_bq(query):
@@ -226,74 +390,6 @@ def query_ctas_bq(query):
     print "The cache table of the final comparison query in BigQuery is: " + cache_table
 
     return cache_table
-
-
-def compare_groupby_count(hive_table, bq_table, column):
-    """Runs a light query on Hive and BigQuery to check if the counts match, using the ideal column estimated before
-
-    :type hive_table: str
-    :param hive_table: full name of the Hive table
-
-    :type bq_table: str
-    :param bq_table: full name of the BigQuery table
-
-    :type column: str
-    :param column: the column used to Group By on
-
-    :rtype: tuple
-    :returns: ``(summary_differences, bq_biggest_distribution)``, where ``summary_differences`` is a list of tuples,
-    one per difference containing (groupByValue, number of differences for this bucket, count of rows for this bucket
-    for the "biggest table"); ``bq_biggest_distribution`` is a boolean saying if BigQuery is the "biggest table": the
-    table that contains more distinct Group By values
-    """
-    logging.info("Executing the 'Group By' Count queries in Hive and BigQuery to do first comparison")
-    hive_query, bq_query = get_groupby_count_sql(hive_table, bq_table, column)
-
-    def launch_hive():
-        cur = query_hive(hive_query)
-        while cur.hasMoreRows:
-            row = cur.fetchone()
-            if row is not None:
-                hive_count_dict[row[0]] = row[1]
-        logging.debug("All %i Hive rows fetched", len(hive_count_dict.keys()))
-        cur.close()
-
-    def launch_bq():
-        for row in query_bq(bq_query):
-            bq_count_dict[row[0]] = row[1]
-        logging.debug("All %i BQ rows fetched", len(bq_count_dict.keys()))
-
-    bq_count_dict = {}
-    hive_count_dict = {}
-    t_bq = threading.Thread(name='bqGroupBy', target=launch_bq)
-    t_hive = threading.Thread(name='hiveGroupBy', target=launch_hive)
-    t_bq.start()
-    t_hive.start()
-    t_bq.join()
-    t_hive.join()
-
-    # #### Let's compare the count between the 2 Group By queries
-    # iterate on biggest dictionary so that we're sure to se a difference if there is one
-    logging.debug("Searching differences in Group By")
-    if len(bq_count_dict.keys()) > len(hive_count_dict.keys()):
-        big_dict = bq_count_dict
-        small_dict = hive_count_dict
-        bq_biggest_distribution = True
-    else:
-        big_dict = hive_count_dict
-        small_dict = bq_count_dict
-        bq_biggest_distribution = False
-    differences = Counter()
-    for (k, v) in big_dict.iteritems():
-        if k not in small_dict:
-            differences[k] = -v  # we want to see the differences where we have less lines to compare
-        elif v != small_dict[k]:
-            differences[k] = -v - small_dict[k]
-    summary_differences = [(k, -v, big_dict[k]) for (k, v) in differences.most_common()]
-    if len(summary_differences) != 0:
-        logging.info("We found at least %i differences in Group By count", len(summary_differences))
-        logging.debug("Differences in Group By count are: %s", summary_differences[:300])
-    return summary_differences, bq_biggest_distribution
 
 
 def show_results_count(hive_table, bq_table, gb_column, differences, bq_biggest):
@@ -533,13 +629,13 @@ def compare_shas(hive_table, bq_table, column):
     hive_query, bq_query = get_intermediate_checksum_sql(hive_table, bq_table, column)
 
     def launch_hive():
-        cur = query_hive("add jar " + jarPath)  # must be in a separated execution
+        cur = query_hive("add jar " + conf.jarPath)  # must be in a separated execution
         cur.execute("create temporary function SHA1 as 'org.apache.hadoop.hive.ql.udf.UDFSha1'")
 
         if "error" in result:
             return
 
-        tmp_table = "%s.temporary_hive_compared_bq_%s" % (myDatabase, str(time.time()).replace('.', '_'))
+        tmp_table = "%s.temporary_hive_compared_bq_%s" % (conf.myDatabase, str(time.time()).replace('.', '_'))
         cur.execute("CREATE TABLE " + tmp_table + " AS\n" + hive_query)
         cur.close()
         result["names_sha_tables"]["hive"] = tmp_table  # we confirm this table has been created
@@ -740,19 +836,19 @@ def show_results_final_differences(hive_sql, bq_sql):
     webbrowser.open("file://" + html_file, new=2)
     return False  # no need to execute the script further since errors have already been spotted
 
-get_table_ddl(fullHiveTable)
-group_by_column = find_groupby_column(fullHiveTable)
+get_table_ddl(conf.fullHiveTable)
+group_by_column = find_groupby_column(conf.fullHiveTable)
 '''
 gb_differences, bq_biggest_dic = compare_groupby_count(fullHiveTable, fullBqTable, group_by_column)
 do_we_continue = show_results_count(fullHiveTable, fullBqTable, group_by_column, gb_differences, bq_biggest_dic)
 if not do_we_continue:
     sys.exit(1)
 '''
-sha_differences, temp_tables = compare_shas(fullHiveTable, fullBqTable, group_by_column)
-queries = get_sql_final_differences(fullHiveTable, fullBqTable, group_by_column, sha_differences, temp_tables)
+sha_differences, temp_tables = compare_shas(conf.fullHiveTable, conf.fullBqTable, group_by_column)
+queries = get_sql_final_differences(conf.fullHiveTable, conf.fullBqTable, group_by_column, sha_differences, temp_tables)
 if queries is None:
     print "Sha queries were done and no differences where found: the tables %s and %s are equal!" \
-          % (fullHiveTable, fullBqTable)
+          % (conf.fullHiveTable, conf.fullBqTable)
     sys.exit(0)
 else:
     show_results_final_differences(queries[0], queries[1])
