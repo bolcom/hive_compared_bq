@@ -32,6 +32,10 @@ class _Table(ABC):
         """Return the (string) type of the database (Hive, BigQuery)"""
         pass
 
+    def get_id_string(self):
+        """Return a string that fully identifies the table"""
+        return self.get_type() + "_" + self.full_name
+
     @abstractmethod
     def _create_connection(self):
         """Connect to the table and return the connection object that we will use to launch queries"""
@@ -95,7 +99,28 @@ class _Table(ABC):
         pass
 
     @abstractmethod
-    def launch_query_dict_result(self, query, result_dic):
+    def create_sql_intermediate_checksums(self):
+        """Build and return the query that generates all the checksums to make the final comparison
+
+        The query will have the following schema:
+
+    WITH blocks AS (
+        SELECT MOD( hash2( column), 100000) as gb, sha1(concat( col0, col1, col2, col3, col4)) as block_0,
+          sha1(concat( col5, col6, col7, col8, col9)) as block_1, ... as block_N FROM table
+    ),
+    full_lines AS (
+        SELECT gb, sha1(concat( block_0, |, block_1...) as row_sha, block_0, block_1 ... FROM blocks
+    )
+    SELECT gb, sha1(concat(list<row_sha>)) as sline, sha1(concat(list<block_0>)) as sblock_1,
+        sha1(concat(list<block_1>)) as sblock_2 ... as sblock_N FROM GROUP BY gb
+
+        :rtype: str
+        :returns: the SQL query with the Group By and the shas
+        """
+        pass
+
+    @abstractmethod
+    def launch_query_dict_result(self, query, result_dic, all_columns_from_2=False):
         """Launch the SQL query and stores the results of the 1st and 2nd columns in the dictionary
 
         The 1st column of each row is stored as the key of the dictionary, the 2nd column is for the value. This method
@@ -107,8 +132,11 @@ class _Table(ABC):
         :type result_dic: dict
         :param result_dic: dictionary to store the result
 
-        :rtype: str
-        :returns: SQL query to do the Group By Count
+        :type all_columns_from_2: bool
+        :param all_columns_from_2: True if we want to fetch all the columns of the row, starting from the 2nd one. False
+                                    if we want the value of the dictionary to only have the 1st column (take care:
+                                    columns start counting with 0).
+                                    (default: False)
         """
         pass
 
@@ -126,6 +154,21 @@ class _Table(ABC):
         :param rows: the (void) array that will store the rows
         """
         pass
+
+    @abstractmethod
+    def launch_query_with_intermediate_table(self, query, result):
+        """Launch the query, stores the results in a temporary table and put the first 2 columns in a dictionary
+
+        This method is used to computes a lot of checksums and thus is a bit heavy to compute. This is why we store
+        all those detailed results in a temporary table. Then present a summary of the returned rows by storing the
+        first 2 columns in a dictionary under the ``result`` dictionary.
+
+        :type query: str
+        :param query: query to execute
+
+        :type result: dict
+        :param result: dictionary to store the result
+        """
 
     def get_sample_query(self):
         """ Build a SQL query to get some sample lines with limited amount of columns
@@ -146,8 +189,9 @@ class _Table(ABC):
         query = query[:-1] + " FROM %s LIMIT %i" % (self.full_name, tc.sample_rows_number)
         return query, selected_columns
 
-    def get_column_blocks(self, ddl):
-        """Returns the list of a column blocks for a specific DDL (see function get_intermediate_checksum_sql)
+    @staticmethod
+    def get_column_blocks(ddl):
+        """Returns the list of a column blocks for a specific DDL (see function create_sql_intermediate_checksums)
 
         :type ddl: list of dict
         :param ddl: the ddl of the tables, containing dictionaries with keys (name, type) to describe each column
@@ -175,7 +219,7 @@ class THive(_Table):
     def get_type(self):
         return "hive"
 
-    def _create_connection(self):  # TODO maybe this underlying object should be private?
+    def _create_connection(self):
         return pyhs2.connect(host=self.server, port=10000, authMechanism="KERBEROS", database=self.database)
 
     def get_ddl_column(self):
@@ -271,6 +315,43 @@ class THive(_Table):
 
         return hive_query
 
+    def create_sql_intermediate_checksums(self):
+        column_blocks = self.get_column_blocks(self.get_ddl_column())
+        number_of_blocks = len(column_blocks)
+        logging.debug("%i column_blocks (with a size of %i columns) have been considered: %s", number_of_blocks,
+                      tc.block_size, str(column_blocks))
+
+        # Generate the concatenations for the column_blocks
+        hive_basic_shas = ""
+        for idx, block in enumerate(column_blocks):
+            hive_basic_shas += "base64( unhex( SHA1( concat( "
+            for col in block:
+                name = col["name"]
+                hive_value_name = name
+                if col["type"] == 'date':
+                    hive_value_name = "cast( %s as STRING)" % name
+                elif "decimal" in col["type"]:  # aligning formatting of Decimal types in Hive with Float in BQ
+                    hive_value_name = 'regexp_replace( %s, "\\.0$", "")' % name
+                hive_basic_shas += "CASE WHEN %s IS NULL THEN 'n_%s' ELSE %s END, '|'," % (name, name[:2],
+                                                                                           hive_value_name)
+            hive_basic_shas = hive_basic_shas[:-6] + ")))) as block_%i,\n" % idx
+        hive_basic_shas = hive_basic_shas[:-2]
+
+        hive_query = "WITH blocks AS (\nSELECT hash(%s) %% %i as gb,\n%s\nFROM %s\n),\n" \
+                     % (self.get_groupby_column(), tc.number_of_group_by, hive_basic_shas, self.full_name)  # 1st CTE
+        # with the basic block shas
+        list_blocks = ", ".join(["block_%i" % i for i in range(number_of_blocks)])
+        hive_query += "full_lines AS(\nSELECT gb, base64( unhex( SHA1( concat( %s)))) as row_sha, %s FROM blocks\n)\n" \
+                      % (list_blocks, list_blocks)  # 2nd CTE to get all the info of a row
+        hive_list_shas = ", ".join(["base64( unhex( SHA1( concat_ws( '|', sort_array( collect_list( block_%i)))))) as "
+                                    "block_%i_gb " % (i, i) for i in range(number_of_blocks)])
+        hive_query += "SELECT gb, base64( unhex( SHA1( concat_ws( '|', sort_array( collect_list( row_sha)))))) as " \
+                      "row_sha_gb, %s FROM full_lines GROUP BY gb" % hive_list_shas  # final query where all the shas
+        # are grouped by row-blocks
+        logging.debug("##### Final Hive query is:\n%s\n", hive_query)
+
+        return hive_query
+
     def query(self, query):
         """Execute the received query in Hive and return the cursor which is ready to be fetched and MUST be closed after
 
@@ -286,12 +367,15 @@ class THive(_Table):
         logging.debug("Fetching Hive results")
         return cur
 
-    def launch_query_dict_result(self, query, result_dic):
+    def launch_query_dict_result(self, query, result_dic, all_columns_from_2=False):
         cur = self.query(query)
         while cur.hasMoreRows:
             row = cur.fetchone()
             if row is not None:
-                result_dic[row[0]] = row[1]
+                if not all_columns_from_2:
+                    result_dic[row[0]] = row[1]
+                else:
+                    result_dic[row[0]] = row[2:]
         logging.debug("All %i Hive rows fetched", len(result_dic))
         cur.close()
 
@@ -304,6 +388,26 @@ class THive(_Table):
                 rows.append(line)
         logging.debug("All %i Hive rows fetched", len(rows))
         cur.close()
+
+    def launch_query_with_intermediate_table(self, query, result):
+        cur = self.query("add jar " + self.jarPath)  # must be in a separated execution
+        cur.execute("create temporary function SHA1 as 'org.apache.hadoop.hive.ql.udf.UDFSha1'")
+
+        if "error" in result:
+            return  # let's stop the thread if some error popped up elsewhere
+
+        tmp_table = "%s.temporary_hive_compared_bq_%s" % (self.database, str(time.time()).replace('.', '_'))
+        cur.execute("CREATE TABLE " + tmp_table + " AS\n" + query)
+        cur.close()
+        result["names_sha_tables"][self.get_id_string()] = tmp_table  # we confirm this table has been created
+        print "The temporary table for Hive is %s. REMEMBER to delete it when you've finished doing the analysis!" \
+              % tmp_table
+
+        if "error" in result:  # A problem happened in BQ so there is no need to pursue or have the temp table
+            return
+
+        projection_hive_row_sha = "SELECT gb, row_sha_gb FROM %s" % tmp_table
+        self.launch_query_dict_result(projection_hive_row_sha, result["sha_dictionaries"][self.get_id_string()])
 
 
 class TBigQuery(_Table):
@@ -329,15 +433,14 @@ class TBigQuery(_Table):
     def get_type(self):
         return "bigQuery"
 
-    def _create_connection(self):  # TODO maybe this underlying object should be private?
+    def _create_connection(self):
         return bigquery.Client()
 
     def get_ddl_column(self):
-        # TODO doc
         if len(self._ddl_columns) > 0:
             return self._ddl_columns
         else:
-            raise AttributeError("DDL for this BigQuery table has not been given yet")
+            raise AttributeError("DDL for this BigQuery table has not been given yet")  # need to be implemented one day
 
     def get_groupby_column(self):
         if self._group_by_column is not None:
@@ -345,18 +448,51 @@ class TBigQuery(_Table):
         raise AttributeError("Not implemented yet for BigQuery since we have to receive the result from Hive")
 
     def create_sql_groupby_count(self):
-        query = self.hash2_js_udf + "SELECT MOD( hash2(%s), %i) as gb, count(*) as count FROM %s GROUP BY gb ORDER BY " \
-                                    "gb" % (self.get_groupby_column(), tc.number_of_group_by, self.full_name)
+        query = self.hash2_js_udf + "SELECT MOD( hash2(%s), %i) as gb, count(*) as count FROM %s GROUP BY gb ORDER " \
+                                    "BY gb" % (self.get_groupby_column(), tc.number_of_group_by, self.full_name)
         logging.debug("BigQuery query is: %s", query)
         return query
 
     def create_sql_show_bucket_columns(self, extra_columns_str, buckets_values):
         gb_column = self.get_groupby_column()
-        bq_query = self.hash2_js_udf + \
-                   "SELECT MOD( hash2(%s), %i) as bucket, %s, %s FROM %s WHERE MOD( hash2(%s), %i) IN (%s)" \
-                                  % (gb_column, tc.number_of_group_by, gb_column, extra_columns_str, self.full_name,
-                                     gb_column, tc.number_of_group_by, buckets_values)
+        bq_query = self.hash2_js_udf + "SELECT MOD( hash2(%s), %i) as bucket, %s, %s FROM %s " \
+                                       "WHERE MOD( hash2(%s), %i) IN (%s)" \
+                                       % (gb_column, tc.number_of_group_by, gb_column, extra_columns_str,
+                                          self.full_name, gb_column, tc.number_of_group_by, buckets_values)
         logging.debug("BQ query to show the buckets and the extra columns is: %s", bq_query)
+
+        return bq_query
+
+    def create_sql_intermediate_checksums(self):
+        column_blocks = self.get_column_blocks(self.get_ddl_column())
+        number_of_blocks = len(column_blocks)
+        logging.debug("%i column_blocks (with a size of %i columns) have been considered: %s", number_of_blocks,
+                      tc.block_size, str(column_blocks))
+
+        # Generate the concatenations for the column_blocks
+        bq_basic_shas = ""
+        for idx, block in enumerate(column_blocks):
+            bq_basic_shas += "TO_BASE64( sha1( concat( "
+            for col in block:
+                name = col["name"]
+                bq_value_name = name
+                if not col["type"] == 'string':
+                    bq_value_name = "cast( %s as STRING)" % name
+                bq_basic_shas += "CASE WHEN %s IS NULL THEN 'n_%s' ELSE %s END, '|'," % (name, name[:2], bq_value_name)
+            bq_basic_shas = bq_basic_shas[:-6] + "))) as block_%i,\n" % idx
+        bq_basic_shas = bq_basic_shas[:-2]
+
+        bq_query = self.hash2_js_udf + "WITH blocks AS (\nSELECT MOD( hash2(%s), %i) as gb,\n%s\nFROM %s\n),\n" \
+                                       % (self.get_groupby_column(), tc.number_of_group_by, bq_basic_shas,
+                                          self.full_name)  # 1st CTE with the basic block shas
+        list_blocks = ", ".join(["block_%i" % i for i in range(number_of_blocks)])
+        bq_query += "full_lines AS(\nSELECT gb, TO_BASE64( sha1( concat( %s))) as row_sha, %s FROM blocks\n)\n" \
+                    % (list_blocks, list_blocks)  # 2nd CTE to get all the info of a row
+        bq_list_shas = ", ".join(["TO_BASE64( sha1( STRING_AGG( block_%i, '|' ORDER BY block_%i))) as block_%i_gb "
+                                  % (i, i, i) for i in range(number_of_blocks)])
+        bq_query += "SELECT gb, TO_BASE64( sha1( STRING_AGG( row_sha, '|' ORDER BY row_sha))) as row_sha_gb, %s FROM " \
+                    "full_lines GROUP BY gb" % bq_list_shas  # final query where all the shas are grouped by row-blocks
+        logging.debug("##### Final BigQuery query is:\n%s\n", bq_query)
 
         return bq_query
 
@@ -372,14 +508,56 @@ class TBigQuery(_Table):
         logging.debug("Launching BigQuery query")
         q = self.connection.run_sync_query(query)
         q.timeout_ms = 60000  # 1 minute to execute the query in BQ should be more than enough
-        q.use_legacy_sql = False  # TODO use maxResults https://cloud.google.com/bigquery/docs/reference/rest/v2/jobs/query?
+        # TODO use maxResults https://cloud.google.com/bigquery/docs/reference/rest/v2/jobs/query? :
+        q.use_legacy_sql = False
         q.run()
         logging.debug("Fetching BigQuery results")
         return q.fetch_data()
 
-    def launch_query_dict_result(self, query, result_dic):
+    def query_ctas_bq(self, query):
+        """Execute the received query in BigQuery and return the name of the cache results table
+
+        This is the equivalent of a "Create Table As a Select" in Hive. The advantage is that BigQuery only keeps that
+        table during 24 hours (we don't have to delete it just like in the case of Hive), and we're not charged for the
+        space used.
+
+        :type query: str
+        :param query: query to execute in BigQuery
+
+        :rtype: str
+        :returns: the full name of the cache table (dataset.table) that stores those results
+
+        :raises: IOError if the query has some execution errors
+        """
+        logging.debug("Launching BigQuery CTAS query")
+        job_name = "job_hive_compared_bq_%f" % time.time()  # Job ID must be unique
+        job = self.connection.run_async_query(job_name.replace('.', '_'),
+                                              query)  # replace(): Job IDs must be alphanumeric
+        job.use_legacy_sql = False
+        job.begin()
+        time.sleep(3)  # 3 second is the minimum latency we get in BQ in general. So no need to try fetching before
+        retry_count = 30  # 1 minute (should be enough)
+        while retry_count > 0 and job.state != 'DONE':
+            retry_count -= 1
+            time.sleep(2)
+            job.reload()
+        logging.debug("BigQuery CTAS query finished")
+
+        if job.errors is not None:
+            raise IOError("There was a problem in executing the query in BigQuery: %s" % str(job.errors))
+
+        cache_table = job.destination.dataset_name + '.' + job.destination.name
+        print "The cache table of the final comparison query in BigQuery is: " + cache_table  # tmp table is
+        # automatically deleted after 1 day. No need to tell the user that they have to delete it
+
+        return cache_table
+
+    def launch_query_dict_result(self, query, result_dic, all_columns_from_2=False):
         for row in self.query(query):
-            result_dic[row[0]] = row[1]
+            if not all_columns_from_2:
+                result_dic[row[0]] = row[1]
+            else:
+                result_dic[row[0]] = row[2:]
         logging.debug("All %i BigQuery rows fetched", len(result_dic))
 
     def launch_query_csv_compare_result(self, query, rows):
@@ -387,6 +565,15 @@ class TBigQuery(_Table):
             line = "^ " + " | ".join([str(col) for col in row]) + " $"
             rows.append(line)
         logging.debug("All %i BigQuery rows fetched", len(rows))
+
+    def launch_query_with_intermediate_table(self, query, result):
+        try:
+            result["names_sha_tables"][self.get_id_string()] = self.query_ctas_bq(query)
+            projection_gb_row_sha = "SELECT gb, row_sha_gb FROM %s" % result["names_sha_tables"][self.get_id_string()]
+            self.launch_query_dict_result(projection_gb_row_sha, result["sha_dictionaries"][self.get_id_string()])
+        except:
+            result["error"] = sys.exc_info()[1]
+            raise
 
 
 class TableComparator(object):
@@ -412,7 +599,8 @@ class TableComparator(object):
 
         self.number_of_group_by = 100000  # 7999 is the limit if you want to manually download the data from BQ. This
         # limit does not apply in this script because we fetch the data with the Python API instead.
-        #  TODO ideally this limit would be dynamic (counting the total rows), in order to get an average of 7 lines per bucket
+        #  TODO ideally this limit would be dynamic (counting the total rows), in order to get an average of 7
+        # lines per bucket
         self.block_size = 5  # 5 columns means that when we want to debug we have enough context. But it small enough to
         #  avoid being charged too much by Google when querying on it
 
@@ -429,6 +617,8 @@ class TableComparator(object):
                      self.tsrc.full_name, self.tsrc.get_type(), self.tdst.full_name, self.tdst.get_type())
         src_query = self.tsrc.create_sql_groupby_count()
         self.tdst._group_by_column = self.tsrc.get_groupby_column()  # the Group By must use the same column
+        self.tdst._ddl_columns = self.tsrc.get_ddl_column()  # TODO we should have the same with BQ and have
+        # a check DDL comparation
         dst_query = self.tdst.create_sql_groupby_count()
 
         result = {"src_count_dict": {}, "dst_count_dict": {}}
@@ -547,111 +737,171 @@ class TableComparator(object):
                 f.write("\n".join(result[instance]))
 
         # TODO put the names of the columns in the 'file name', so that it's easy to debug
-        diff = difflib.HtmlDiff().make_file(result["big_rows"], result["small_rows"],
-                                            bigtable.get_type() + "-" + bigtable.full_name,
-                                            smalltable.get_type() + "-" + smalltable.full_name,
-                                            context=False, numlines=30)
+        diff_string = difflib.HtmlDiff().make_file(result["big_rows"], result["small_rows"], bigtable.get_id_string(),
+                                                   smalltable.get_id_string(), context=False, numlines=30)
         html_file = "/tmp/count_diff.html"
         with open(html_file, "w") as f:
-            f.write(diff)
+            f.write(diff_string)
         logging.debug("Sorted results of the queries are in the files %s and %s. HTML differences are in %s",
                       sorted_file["big_rows"], sorted_file["small_rows"], html_file)
         webbrowser.open("file://" + html_file, new=2)
         return False  # no need to execute the script further since errors have already been spotted
 
-    def compare_shas(self, hive_table, bq_table, column):
+    def compare_shas(self):  # TODO doc
         """Runs the final queries on Hive and BigQuery to check if the checksum match and return the list of differences
 
-        :type hive_table: str
-        :param hive_table: full name of the Hive table
-
-        :type bq_table: str
-        :param bq_table: full name of the BigQuery table
-
-        :type column: str
-        :param column: the column used to Group By on
-
         :rtype: tuple
-        :returns: ``(list_differences, names_sha_tables)``, where ``list_differences`` is the list of Group By values which
-        present different row checksums; ``names_sha_tables`` is a dictionary that contains the names of the "temporary"
-        result tables
+        :returns: ``(list_differences, names_sha_tables)``, where ``list_differences`` is the list of Group By values
+                    which presents different row checksums; ``names_sha_tables`` is a dictionary that contains the names
+                    of the "temporary" result tables
         """
-        logging.info("Executing the 'shas' queries for %s (%s) and %s (%s) to do final comparison",
-                     self.tsrc.full_name, self.tsrc.get_type(), self.tdst.full_name, self.tdst.get_type())
+        logging.info("Executing the 'shas' queries for %s and %s to do final comparison",
+                     self.tsrc.get_id_string(), self.tdst.get_id_string())
 
-        hive_query, bq_query = get_intermediate_checksum_sql(hive_table, bq_table, column)
+        tsrc_query = self.tsrc.create_sql_intermediate_checksums()
+        tdst_query = self.tdst.create_sql_intermediate_checksums()
 
-        def launch_hive():
-            cur = query_hive("add jar " + conf.jarPath)  # must be in a separated execution
-            cur.execute("create temporary function SHA1 as 'org.apache.hadoop.hive.ql.udf.UDFSha1'")
+        result = {"names_sha_tables": {}, "sha_dictionaries": {
+            self.tsrc.get_id_string(): {},
+            self.tdst.get_id_string(): {}
+        }}
+        t_src = threading.Thread(name='shaBy-' + self.tsrc.get_id_string(),
+                                 target=self.tsrc.launch_query_with_intermediate_table,
+                                 args=(tsrc_query, result))
+        t_dst = threading.Thread(name='shaBy-' + self.tdst.get_id_string(),
+                                 target=self.tdst.launch_query_with_intermediate_table,
+                                 args=(tdst_query, result))
+        t_src.start()
+        t_dst.start()
+        t_src.join()
+        t_dst.join()
 
-            if "error" in result:
-                return
-
-            tmp_table = "%s.temporary_hive_compared_bq_%s" % (conf.myDatabase, str(time.time()).replace('.', '_'))
-            cur.execute("CREATE TABLE " + tmp_table + " AS\n" + hive_query)
-            cur.close()
-            result["names_sha_tables"]["hive"] = tmp_table  # we confirm this table has been created
-            print "The temporary table for Hive is %s. REMEMBER to delete it when you've finished doing the analysis!" \
-                  % tmp_table
-
-            if "error" in result:  # A problem happened in BQ so there is no need to pursue or have the temp table
-                return
-
-            projection_hive_row_sha = "SELECT gb, row_sha_gb FROM %s" % result["names_sha_tables"]["hive"]
-            cur = query_hive(projection_hive_row_sha)
-            while cur.hasMoreRows:
-                row = cur.fetchone()
-                if row is not None:
-                    result["hive_sha_dict"][row[0]] = row[1]
-            logging.debug("All %i Hive rows fetched", len(result["hive_sha_dict"]))
-            cur.close()
-
-        def launch_bq():
-            try:
-                result["names_sha_tables"]["bq"] = query_ctas_bq(
-                    bq_query)  # tmp table is automatically deleted after 1 day
-                projection_gb_row_sha = "SELECT gb, row_sha_gb FROM %s" % result["names_sha_tables"]["bq"]
-                for row in query_bq(projection_gb_row_sha):
-                    result["bq_sha_dict"][row[0]] = row[1]
-            except:
-                result["error"] = sys.exc_info()[1]
-                raise
-            logging.debug("All %i BQ rows fetched", len(result["bq_sha_dict"].keys()))
-
-        result = {"names_sha_tables": {}, "bq_sha_dict": {}, "hive_sha_dict": {}}
-        t_bq = threading.Thread(name='bqShaBy', target=launch_bq)
-        t_hive = threading.Thread(name='hiveShaBy', target=launch_hive)
-        t_bq.start()
-        t_hive.start()
-        t_bq.join()
-        t_hive.join()
-
-        if "error" in result:
+        if "error" in result:  # TODO we need to solve this problem later
             if "hive" in result["names_sha_tables"]:
                 query_hive("DROP TABLE " + str(result["names_sha_tables"]["hive"])).close()
             sys.exit(result["error"])
 
         # Comparing the results of those dictionaries
         logging.debug("Searching differences in Group By")
-        bq_num_gb = len(result["bq_sha_dict"])
-        hive_num_gb = len(result["hive_sha_dict"])
-        if not bq_num_gb == hive_num_gb:
-            sys.exit("The number of Group By values is not the same when doing the final sha queries (Hive: %i - "
-                     "BigQuery: %i).\nMake sure to first execute the 'count' verification step!" % (
-                     bq_num_gb, hive_num_gb))
+        src_num_gb = len(result["sha_dictionaries"][self.tsrc.get_id_string()])
+        dst_num_gb = len(result["sha_dictionaries"][self.tdst.get_id_string()])
+        if not src_num_gb == dst_num_gb:
+            sys.exit("The number of Group By values is not the same when doing the final sha queries (%s: %i - "
+                     "%s: %i).\nMake sure to first execute the 'count' verification step!"
+                     % (self.tsrc.get_id_string(), src_num_gb, self.tdst.get_id_string(), dst_num_gb))
 
         list_differences = []
-        for (k, v) in result["bq_sha_dict"].iteritems():
-            if k not in result["hive_sha_dict"]:
-                sys.exit("The Group By value %s appears in BigQuery but not in Hive.\nMake sure to first execute the "
-                         "'count' verification step!" % k)
-            elif v != result["hive_sha_dict"][k]:
+        for (k, v) in result["sha_dictionaries"][self.tdst.get_id_string()].iteritems():
+            if k not in result["sha_dictionaries"][self.tsrc.get_id_string()]:
+                sys.exit("The Group By value %s appears in %s but not in %s.\nMake sure to first execute the "
+                         "'count' verification step!" % (k, self.tdst.get_id_string(), self.tsrc.get_id_string()))
+            elif v != result["sha_dictionaries"][self.tsrc.get_id_string()][k]:
                 list_differences.append(k)
         if len(list_differences) != 0:
             logging.info("We found %i differences in sha verification", len(list_differences))
             logging.debug("Differences in Group By count are: %s", list_differences[:300])
         return list_differences, result["names_sha_tables"]
+
+    def get_sql_final_differences(self, differences, temp_tables):
+        """Return the queries to get the real data for the differences found in the last compare_shas() step
+
+        :type differences: list of str
+        :param differences: the list of Group By values which present different row checksums
+
+        :type temp_tables: dict
+        :param temp_tables: contains the names of the temporary tables ["hive", "bq"]
+
+        :rtype: tuple of str
+        :returns: ``(hive_final_sql, bq_final_sql)``, the queries to be executed to do the final debugging
+        """
+        subset_differences = str(differences[:8])[1:-1]  # we will just show some few (8) differences
+        logging.debug("The sha differences that we consider are: %s", str(subset_differences))
+
+        src_query = "SELECT * FROM %s WHERE gb IN (%s)" % (temp_tables[self.tsrc.get_id_string()], subset_differences)
+        dst_query = "SELECT * FROM %s WHERE gb IN (%s)" % (temp_tables[self.tdst.get_id_string()], subset_differences)
+        logging.debug("queries to find differences in bucket_blocks are: \n%s\n%s", src_query, dst_query)
+
+        src_sha_lines = {}  # key=gb, values=list of shas from the blocks (not the one of the whole line)
+        dst_sha_lines = {}
+        t_src = threading.Thread(name='srcFetchShaDifferences', target=self.tsrc.launch_query_dict_result,
+                                 args=(src_query, src_sha_lines, True))
+        t_dst = threading.Thread(name='dstFetchShaDifferences', target=self.tdst.launch_query_dict_result,
+                                 args=(dst_query, dst_sha_lines, True))
+        t_src.start()
+        t_dst.start()
+        t_src.join()
+        t_dst.join()
+        logging.debug("The 8 sha lines for %s are: %s. The 8 sha lines for %s are: %s", self.tsrc.get_id_string(),
+                      src_sha_lines, self.tdst.get_id_string(), dst_sha_lines)
+
+        # We want to find the column blocks that present most of the differences, and the bucket_rows associated to it
+        blocks_most_differences = Counter()
+        column_blocks = _Table.get_column_blocks(self.tsrc.get_ddl_column())
+        map_colblocks_bucketrows = [[] for x in range(len(column_blocks))]
+        for bucket_row, bq_blocks in dst_sha_lines.iteritems():
+            hive_blocks = src_sha_lines[bucket_row]
+            for idx, sha in enumerate(bq_blocks):
+                if sha != hive_blocks[idx]:
+                    blocks_most_differences[idx] += 1
+                    map_colblocks_bucketrows[idx].append(bucket_row)
+        logging.debug("Block columns with most differences are: %s. Which correspond to those bucket rows: %s",
+                      blocks_most_differences, map_colblocks_bucketrows)
+
+        block_most_different = blocks_most_differences.most_common(1)[0][0]  # TODO we should check if we have enough
+        # buckets otherwise we might want to take a second block
+        list_column_to_check = " ,".join([x["name"] for x in column_blocks[block_most_different]])
+        list_hashs = " ,".join(map(str, map_colblocks_bucketrows[block_most_different]))
+
+        src_final_sql = self.tsrc.create_sql_show_bucket_columns(list_column_to_check, list_hashs)
+        dst_final_sql = self.tdst.create_sql_show_bucket_columns(list_column_to_check, list_hashs)
+        logging.debug("Final source query is: %s   -   Final dest query is: %s", src_final_sql, dst_final_sql)
+
+        return src_final_sql, dst_final_sql
+
+    @staticmethod
+    def display_html_diff(result, file_name):  # TODO doc
+        sorted_file = {}
+        keys = result.keys()
+        for instance in keys:
+            result[instance].sort()
+            sorted_file[instance] = file_name + "_" + instance
+            with open(sorted_file[instance], "w") as f:
+                f.write("\n".join(result[instance]))
+
+        # TODO put the names of the columns in the 'file name', so that it's easy to debug
+        diff_html = difflib.HtmlDiff().make_file(result[keys[0]], result[keys[1]], keys[0], keys[1], context=False,
+                                                 numlines=30)
+        html_file = file_name + ".html"
+        with open(html_file, "w") as f:
+            f.write(diff_html)
+        logging.debug("Sorted results of the queries are in the files %s and %s. HTML differences are in %s",
+                      sorted_file[keys[0]], sorted_file[keys[1]], html_file)
+        webbrowser.open("file://" + html_file, new=2)
+
+    def show_results_final_differences(self, src_sql, dst_sql):
+        """If any differences found in the shas analysis step, then show them in a webpage
+
+        :type src_sql: str
+        :param src_sql: the query of the source table to launch to see the rows that are different
+
+        :type dst_sql: str
+        :param dst_sql: the query of the destination table to launch to see the rows that are different
+        """
+        src_id = self.tsrc.get_id_string()
+        dst_id = self.tdst.get_id_string()
+        result = {src_id: [], dst_id: []}
+        t_src = threading.Thread(name='srcShowShaFinalDifferences', target=self.tsrc.launch_query_csv_compare_result,
+                                 args=(src_sql, result[src_id]))
+        t_dst = threading.Thread(name='dstShowShaFinalDifferences', target=self.tdst.launch_query_csv_compare_result,
+                                 args=(dst_sql, result[dst_id]))
+        t_src.start()
+        t_dst.start()
+        t_src.join()
+        t_dst.join()
+
+        tc.display_html_diff(result, "/tmp/sha_diff")
+
+        return False  # no need to execute the script further since errors have already been spotted
 
 
 logging.basicConfig(level=logging.DEBUG, format='[%(levelname)s]\t[%(asctime)s]  (%(threadName)-10s) %(message)s',)
@@ -662,269 +912,10 @@ do_we_continue = tc.show_results_count(diff, big_small)
 if not do_we_continue:
     sys.exit(1)
 
-sha_differences, temp_tables = compare_shas(conf.fullHiveTable, conf.fullBqTable, group_by_column)
-queries = get_sql_final_differences(conf.fullHiveTable, conf.fullBqTable, group_by_column, sha_differences, temp_tables)
-if queries is None:
+sha_differences, temporary_tables = tc.compare_shas()
+if len(sha_differences) == 0:
     print "Sha queries were done and no differences where found: the tables %s and %s are equal!" \
-          % (conf.fullHiveTable, conf.fullBqTable)
+          % (tc.tsrc.get_id_string(), tc.tdst.get_id_string())
     sys.exit(0)
-else:
-    show_results_final_differences(queries[0], queries[1])
-
-def query_ctas_bq(query):
-    """Execute the received query in BigQuery and return the name of the cache results table
-
-    This is the equivalent of a "Create Table As a Select" in Hive. The advantage is that BigQuery only keeps that
-    table during 24 hours (we don't have to delete it just like in the case of Hive), and we're not charged for the
-    space used.
-
-    :type query: str
-    :param query: query to execute in BigQuery
-
-    :rtype: str
-    :returns: the full name of the cache table (dataset.table) that stores those results
-
-    :raises: IOError if the query has some execution errors
-    """
-
-    logging.debug("Launching BigQuery CTAS query")
-    job_name = "job_hive_compared_bq_%f" % time.time()  # Job ID must be unique
-    job = bigquery_client.run_async_query(job_name.replace('.', '_'), query)  # replace(): Job IDs must be alphanumeric
-    job.use_legacy_sql = False
-    job.begin()
-    time.sleep(3)  # minimum latency we will get in BQ
-    retry_count = 30  # 1 minute
-    while retry_count > 0 and job.state != 'DONE':
-        retry_count -= 1
-        time.sleep(2)
-        job.reload()
-    logging.debug("BigQuery CTAS query finished")
-
-    if job.errors is not None:
-        raise IOError("There was a problem in executing the query in BigQuery: %s" % str(job.errors))
-
-    cache_table = job.destination.dataset_name + '.' + job.destination.name
-    print "The cache table of the final comparison query in BigQuery is: " + cache_table
-
-    return cache_table
-
-
-def get_intermediate_checksum_sql(hive_table, bq_table, column):
-    """Build and return the queries that generate all the checksums to make the final comparison
-
-    The queries will have the following schema:
-
-WITH blocks AS (
-    SELECT MOD( hash2( column), 100000) as gb, sha1(concat( col0, col1, col2, col3, col4)) as block_0,
-      sha1(concat( col5, col6, col7, col8, col9)) as block_1, ... as block_N FROM table
-),
-full_lines AS (
-    SELECT gb, sha1(concat( block_0, |, block_1...) as row_sha, block_0, block_1 ... FROM blocks
-)
-SELECT gb, sha1(concat(list<row_sha>)) as sline, sha1(concat(list<block_0>)) as sblock_1,
-    sha1(concat(list<block_1>)) as sblock_2 ... as sblock_N FROM GROUP BY gb
-
-    :type hive_table: str
-    :param hive_table: full name of the Hive table
-
-    :type bq_table: str
-    :param bq_table: full name of the BigQuery table
-
-    :type column: str
-    :param column: the column used to Group By on
-
-    :rtype: tuple of str
-    :returns: the Hive query , the BQ query
-    """
-
-    column_blocks = get_column_blocks(ddlColumns)
-    number_of_blocks = len(column_blocks)
-    logging.debug("%i column_blocks (with a size of %i columns) have been considered: %s", number_of_blocks, block_size,
-                  str(column_blocks))
-
-    # Generate the concatenations for the column_blocks
-    hive_basic_shas = ""
-    bq_basic_shas = ""
-    for idx, block in enumerate(column_blocks):
-        hive_basic_shas += "base64( unhex( SHA1( concat( "
-        bq_basic_shas += "TO_BASE64( sha1( concat( "
-        for col in block:
-            name = col["name"]
-            hive_value_name = name
-            bq_value_name = name
-            if col["type"] == 'date':
-                hive_value_name = "cast( %s as STRING)" % name
-            elif "decimal" in col["type"]:  # aligning formatting of Decimal types in Hive with Float in BQ
-                hive_value_name = 'regexp_replace( %s, "\\.0$", "")' % name
-            if not col["type"] == 'string':
-                bq_value_name = "cast( %s as STRING)" % name
-            hive_basic_shas += "CASE WHEN %s IS NULL THEN 'n_%s' ELSE %s END, '|'," % (name, name[:2], hive_value_name)
-            bq_basic_shas += "CASE WHEN %s IS NULL THEN 'n_%s' ELSE %s END, '|'," % (name, name[:2], bq_value_name)
-        hive_basic_shas = hive_basic_shas[:-6] + ")))) as block_%i,\n" % idx
-        bq_basic_shas = bq_basic_shas[:-6] + "))) as block_%i,\n" % idx
-    hive_basic_shas = hive_basic_shas[:-2]
-    bq_basic_shas = bq_basic_shas[:-2]
-
-    hive_query = "WITH blocks AS (\nSELECT hash(%s) %% %i as gb,\n%s\nFROM %s\n),\n" \
-                 % (column, number_of_group_by, hive_basic_shas, hive_table)  # 1st CTE with the basic block shas
-    list_blocks = ", ".join(["block_%i" % i for i in range(number_of_blocks)])
-    hive_query += "full_lines AS(\nSELECT gb, base64( unhex( SHA1( concat( %s)))) as row_sha, %s FROM blocks\n)\n" % \
-                  (list_blocks, list_blocks)  # 2nd CTE to get all the info of a row
-    hive_list_shas = ", ".join(["base64( unhex( SHA1( concat_ws( '|', sort_array( collect_list( block_%i)))))) as "
-                                "block_%i_gb " % (i, i) for i in range(number_of_blocks)])
-    hive_query += "SELECT gb, base64( unhex( SHA1( concat_ws( '|', sort_array( collect_list( row_sha)))))) as " \
-                  "row_sha_gb, %s FROM full_lines GROUP BY gb" % hive_list_shas  # final query where all the shas are
-    # grouped by row-blocks
-    logging.debug("##### Final Hive query is:\n%s\n", hive_query)
-
-    bq_query = hash2_js_udf + "WITH blocks AS (\nSELECT MOD( hash2(%s), %i) as gb,\n%s\nFROM %s\n),\n" \
-                              % (column, number_of_group_by, bq_basic_shas, bq_table)  # 1st CTE
-    bq_query += "full_lines AS(\nSELECT gb, TO_BASE64( sha1( concat( %s))) as row_sha, %s FROM blocks\n)\n"\
-                % (list_blocks, list_blocks)  # 2nd CTE to get all the info of a row
-    bq_list_shas = ", ".join(["TO_BASE64( sha1( STRING_AGG( block_%i, '|' ORDER BY block_%i))) as block_%i_gb "
-                              % (i, i, i) for i in range(number_of_blocks)])
-    bq_query += "SELECT gb, TO_BASE64( sha1( STRING_AGG( row_sha, '|' ORDER BY row_sha))) as row_sha_gb, %s FROM " \
-                "full_lines GROUP BY gb" % bq_list_shas  # final query where all the shas are grouped by row-blocks
-    logging.debug("##### Final BigQuery query is:\n%s\n", bq_query)
-
-    return hive_query, bq_query
-
-
-def get_sql_final_differences(hive_table, bq_table, gb_column, differences, temporary_tables):
-    """If any differences found in the last sha step, then return the queries to get the real data for those differences
-
-    :type hive_table: str
-    :param hive_table: full name of the Hive table
-
-    :type bq_table: str
-    :param bq_table: full name of the BigQuery table
-
-    :type gb_column: str
-    :param gb_column: the column used to Group By on
-
-    :type differences: list of str
-    :param differences: the list of Group By values which present different row checksums
-
-    :type temporary_tables: dict
-    :param temporary_tables: contains the names of the temporary tables ["hive", "bq"]
-
-    :rtype: tuple of str
-    :returns: ``(hive_final_sql, bq_final_sql)``, the queries to be executed to do the final debugging, or None if no
-    differences have been found in the shas analysis and the tables are considered equal
-    """
-    if len(differences) == 0:
-        return None
-    subset_differences = str(differences[:8])[1:-1]  # we will just show some few (8) differences
-    logging.debug("The sha differences that we consider are: %s", str(subset_differences))
-
-    hive_query = "SELECT * FROM %s WHERE gb IN (%s)" % (temporary_tables["hive"], subset_differences)
-    logging.debug("Hive query to find differences in bucket_blocks is: %s", hive_query)
-    bq_query = "SELECT * FROM %s WHERE gb IN (%s)" % (temporary_tables["bq"], subset_differences)
-    logging.debug("BQ query to find differences in bucket_blocks is: %s", bq_query)
-
-    def launch_hive():
-        cur = query_hive(hive_query)
-        while cur.hasMoreRows:
-            row = cur.fetchone()
-            if row is not None:
-                hive_sha_lines[row[0]] = row[2:]
-        logging.debug("All %i Hive rows fetched", len(hive_sha_lines))
-        cur.close()
-
-    def launch_bq():
-        for row in query_bq(bq_query):
-            bq_sha_lines[row[0]] = row[2:]
-        logging.debug("All %i BQ rows fetched", len(bq_sha_lines))
-
-    bq_sha_lines = {}  # key=gb, values=list of shas from the blocks (not the one of the whole line)
-    hive_sha_lines = {}
-    t_bq = threading.Thread(name='bqFetchShaDifferences', target=launch_bq)
-    t_hive = threading.Thread(name='hiveFetchShaDifferences', target=launch_hive)
-    t_bq.start()
-    t_hive.start()
-    t_bq.join()
-    t_hive.join()
-    logging.debug("The 8 sha lines for Hive are: %s. The 8 sha lines for BigQuery are: %s", hive_sha_lines,
-                  bq_sha_lines)
-
-    # We want to find the column blocks that present most of the differences, and the bucket_rows associated to it
-    blocks_most_differences = Counter()
-    column_blocks = get_column_blocks(ddlColumns)
-    map_colblocks_bucketrows = [[] for x in range(len(column_blocks))]
-    for bucket_row, bq_blocks in bq_sha_lines.iteritems():
-        hive_blocks = hive_sha_lines[bucket_row]
-        for idx, sha in enumerate(bq_blocks):
-            if sha != hive_blocks[idx]:
-                blocks_most_differences[idx] += 1
-                map_colblocks_bucketrows[idx].append(bucket_row)
-    logging.debug("Block columns with most differences are: %s. Which correspond to those bucket rows: %s",
-                  blocks_most_differences, map_colblocks_bucketrows)
-
-    block_most_different = blocks_most_differences.most_common(1)[0][0]  # TODO we should check if we have enough
-    # buckets otherwise we might want to take a second block
-    list_column_to_check = " ,".join([x["name"] for x in column_blocks[block_most_different]])
-    list_hashs = " ,".join(map(str, map_colblocks_bucketrows[block_most_different]))
-
-    hive_final_sql = "SELECT %s, %s FROM %s WHERE hash(%s) %% %i IN (%s)" \
-                     % (gb_column, list_column_to_check, hive_table, gb_column, number_of_group_by, list_hashs)
-    bq_final_sql = hash2_js_udf + "SELECT %s, %s FROM %s WHERE MOD( hash2(%s), %i) IN (%s)" \
-                                  % (gb_column, list_column_to_check, bq_table, gb_column, number_of_group_by,
-                                     list_hashs)
-    logging.debug("Final Hive query is: %s   -   Final BQ query is: %s", hive_final_sql, bq_final_sql)
-
-    return hive_final_sql, bq_final_sql
-
-
-def show_results_final_differences(hive_sql, bq_sql):
-    """If any differences found in the shas analysis step, then show them in a webpage
-
-    :type hive_sql: str
-    :param hive_sql: hive query to launch to see the rows that are different
-
-    :type bq_sql: str
-    :param bq_sql: BigQuery query to launch to see the rows that are different
-    """
-    def launch_hive():
-        cur = query_hive(hive_sql)
-        while cur.hasMoreRows:
-            row = cur.fetchone()
-            if row is not None:
-                line = "^ " + " | ".join([str(col) for col in row]) + " $"
-                hive_lines.append(line)
-        logging.debug("All %i Hive rows fetched", len(hive_lines))
-        cur.close()
-
-    def launch_bq():
-        for row in query_bq(bq_sql):
-            line = "^ " + " | ".join([str(col) for col in row]) + " $"
-            bq_lines.append(line)
-        logging.debug("All %i BQ rows fetched", len(bq_lines))
-
-    bq_lines = []
-    hive_lines = []
-    t_bq = threading.Thread(name='bqShowShaDifferences', target=launch_bq)
-    t_hive = threading.Thread(name='hiveShaCountDifferences', target=launch_hive)
-    t_bq.start()
-    t_hive.start()
-    t_bq.join()
-    t_hive.join()
-
-    # TODO: this function could be repeated with the other show function?
-    bq_lines.sort()
-    bq_file = "/tmp/sha_diff_bq"
-    with open(bq_file, "w") as f:
-        f.write("\n".join(bq_lines))
-    hive_lines.sort()
-    hive_file = "/tmp/sha_diff_hive"
-    with open(hive_file, "w") as f:
-        f.write("\n".join(hive_lines))
-    diff = difflib.HtmlDiff().make_file(hive_lines, bq_lines, "Hive", "BigQuery", context=False, numlines=30)
-    html_file = "/tmp/sha_diff.html"
-    with open(html_file, "w") as f:
-        f.write(diff)
-    logging.debug("Sorted results of the queries are in the files %s and %s. HTML differences are in %s",
-                  hive_file, bq_file, html_file)
-    webbrowser.open("file://" + html_file, new=2)
-    return False  # no need to execute the script further since errors have already been spotted
-
-
+queries = tc.get_sql_final_differences(sha_differences, temporary_tables)
+tc.show_results_final_differences(queries[0], queries[1])
