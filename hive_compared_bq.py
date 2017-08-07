@@ -18,9 +18,10 @@ class _Table(ABC):
 
     __metaclass__ = ABCMeta
 
-    def __init__(self, database, table):
+    def __init__(self, database, table, parent):
         self.database = database
         self.table = table
+        self.tc = parent
         self.full_name = database + '.' + table
         self.connection = self._create_connection()
         self._ddl_columns = []  # array instead of dictionary because we want to maintain the order of the columns
@@ -120,6 +121,15 @@ class _Table(ABC):
         pass
 
     @abstractmethod
+    def delete_temporary_table(self, table_name):
+        """Drop the temporary table if needed (if it is not automatically deleted by the system)
+
+        :type table_name: str
+        :param table_name: name of the table to delete
+        """
+        pass
+
+    @abstractmethod
     def launch_query_dict_result(self, query, result_dic, all_columns_from_2=False):
         """Launch the SQL query and stores the results of the 1st and 2nd columns in the dictionary
 
@@ -183,14 +193,13 @@ class _Table(ABC):
                     list of columns that are fetched
         """
         query = "SELECT"
-        selected_columns = self.get_ddl_column()[:tc.sample_column_number]
+        selected_columns = self.get_ddl_column()[:self.tc.sample_column_number]
         for col in selected_columns:
             query += " %s," % col["name"]  # for the last column we'll remove that trailing ","
-        query = query[:-1] + " FROM %s LIMIT %i" % (self.full_name, tc.sample_rows_number)
+        query = query[:-1] + " FROM %s LIMIT %i" % (self.full_name, self.tc.sample_rows_number)
         return query, selected_columns
 
-    @staticmethod
-    def get_column_blocks(ddl):
+    def get_column_blocks(self, ddl):
         """Returns the list of a column blocks for a specific DDL (see function create_sql_intermediate_checksums)
 
         :type ddl: list of dict
@@ -201,8 +210,8 @@ class _Table(ABC):
         """
         column_blocks = []
         for idx, col in enumerate(ddl):
-            block_id = idx / tc.block_size
-            if idx % tc.block_size == 0:
+            block_id = idx / self.tc.block_size
+            if idx % self.tc.block_size == 0:
                 column_blocks.append([])
             column_blocks[block_id].append({"name": col["name"], "type": col["type"]})
         return column_blocks
@@ -211,9 +220,9 @@ class _Table(ABC):
 class THive(_Table):
     """Hive implementation of the _Table object"""
 
-    def __init__(self, database, table, cluster):
+    def __init__(self, database, table, parent, cluster):
         self.server = 'shd-hdp-' + cluster + '-master-003.bolcom.net'
-        _Table.__init__(self, database, table)
+        _Table.__init__(self, database, table, parent)
         self.jarPath = 'hdfs://hdp-' + cluster + '/user/sluangsay/lib/sha1.jar'
 
     def get_type(self):
@@ -259,7 +268,7 @@ class THive(_Table):
 
         #  Get a sample from the table and fill Counters to each column
         logging.info("Analyzing the columns %s with a sample of %i values", str([x["name"] for x in selected_columns]),
-                     tc.sample_rows_number)
+                     self.tc.sample_rows_number)
         for col in selected_columns:
             col["Counter"] = Counter()
         cur = self.connection.cursor()
@@ -273,7 +282,7 @@ class THive(_Table):
         cur.close()
 
         #  Look at the statistics to estimate which column is the best to do a GROUP BY
-        max_frequent_number = tc.sample_rows_number * tc.max_percent_most_frequent_value_in_column / 100
+        max_frequent_number = self.tc.sample_rows_number * self.tc.max_percent_most_frequent_value_in_column / 100
         minimum_weight = sys.maxint
         highest_first = max_frequent_number
         for col in selected_columns:
@@ -285,23 +294,23 @@ class THive(_Table):
                 continue
             # The biggest value is not too high, so let's see how big are the 50 biggest values
             weight_of_most_frequent_values = sum([x[1] for x in col["Counter"]
-                                                 .most_common(tc.number_of_most_frequent_values_to_weight)])
+                                                 .most_common(self.tc.number_of_most_frequent_values_to_weight)])
             logging.debug("%s: sum up of the %i most frequent apparitions: %i", col["name"],
-                          tc.number_of_most_frequent_values_to_weight, weight_of_most_frequent_values)
+                          self.tc.number_of_most_frequent_values_to_weight, weight_of_most_frequent_values)
             if weight_of_most_frequent_values < minimum_weight:
                 self._group_by_column = col["name"]
                 minimum_weight = weight_of_most_frequent_values
                 highest_first = highest[1]
         logging.info("Best column to do a GROUP BY is %s (apparitions of most frequent value: %i / the %i most frequent"
                      "values sum up %i apparitions)", self._group_by_column, highest_first,
-                     tc.number_of_most_frequent_values_to_weight, minimum_weight)
+                     self.tc.number_of_most_frequent_values_to_weight, minimum_weight)
 
         return self._group_by_column
 
     def create_sql_groupby_count(self):
         query = "SELECT hash( %s) %% %s AS gb, count(*) AS count FROM %s GROUP BY hash(%s) %% %i"\
-                % (self.get_groupby_column(), tc.number_of_group_by, self.full_name, self.get_groupby_column(),
-                   tc.number_of_group_by)
+                % (self.get_groupby_column(), self.tc.number_of_group_by, self.full_name, self.get_groupby_column(),
+                   self.tc.number_of_group_by)
         logging.debug("Hive query is: %s", query)
 
         return query
@@ -309,8 +318,8 @@ class THive(_Table):
     def create_sql_show_bucket_columns(self, extra_columns_str, buckets_values):
         gb_column = self.get_groupby_column()
         hive_query = "SELECT hash(%s) %% %i as bucket, %s, %s FROM %s WHERE hash(%s) %% %i IN (%s)" \
-                     % (gb_column, tc.number_of_group_by, gb_column, extra_columns_str, self.full_name, gb_column,
-                        tc.number_of_group_by, buckets_values)
+                     % (gb_column, self.tc.number_of_group_by, gb_column, extra_columns_str, self.full_name, gb_column,
+                        self.tc.number_of_group_by, buckets_values)
         logging.debug("Hive query to show the buckets and the extra columns is: %s", hive_query)
 
         return hive_query
@@ -319,7 +328,7 @@ class THive(_Table):
         column_blocks = self.get_column_blocks(self.get_ddl_column())
         number_of_blocks = len(column_blocks)
         logging.debug("%i column_blocks (with a size of %i columns) have been considered: %s", number_of_blocks,
-                      tc.block_size, str(column_blocks))
+                      self.tc.block_size, str(column_blocks))
 
         # Generate the concatenations for the column_blocks
         hive_basic_shas = ""
@@ -338,8 +347,8 @@ class THive(_Table):
         hive_basic_shas = hive_basic_shas[:-2]
 
         hive_query = "WITH blocks AS (\nSELECT hash(%s) %% %i as gb,\n%s\nFROM %s\n),\n" \
-                     % (self.get_groupby_column(), tc.number_of_group_by, hive_basic_shas, self.full_name)  # 1st CTE
-        # with the basic block shas
+                     % (self.get_groupby_column(), self.tc.number_of_group_by, hive_basic_shas, self.full_name)  # 1st
+        # CTE with the basic block shas
         list_blocks = ", ".join(["block_%i" % i for i in range(number_of_blocks)])
         hive_query += "full_lines AS(\nSELECT gb, base64( unhex( SHA1( concat( %s)))) as row_sha, %s FROM blocks\n)\n" \
                       % (list_blocks, list_blocks)  # 2nd CTE to get all the info of a row
@@ -351,6 +360,9 @@ class THive(_Table):
         logging.debug("##### Final Hive query is:\n%s\n", hive_query)
 
         return hive_query
+
+    def delete_temporary_table(self, table_name):
+        self.query_hive("DROP TABLE " + table_name).close()
 
     def query(self, query):
         """Execute the received query in Hive and return the cursor which is ready to be fetched and MUST be closed after
@@ -400,6 +412,8 @@ class THive(_Table):
         cur.execute("CREATE TABLE " + tmp_table + " AS\n" + query)
         cur.close()
         result["names_sha_tables"][self.get_id_string()] = tmp_table  # we confirm this table has been created
+        result["cleaning"] = (tmp_table, self)
+
         print "The temporary table for Hive is %s. REMEMBER to delete it when you've finished doing the analysis!" \
               % tmp_table
 
@@ -449,7 +463,7 @@ class TBigQuery(_Table):
 
     def create_sql_groupby_count(self):
         query = self.hash2_js_udf + "SELECT MOD( hash2(%s), %i) as gb, count(*) as count FROM %s GROUP BY gb ORDER " \
-                                    "BY gb" % (self.get_groupby_column(), tc.number_of_group_by, self.full_name)
+                                    "BY gb" % (self.get_groupby_column(), self.tc.number_of_group_by, self.full_name)
         logging.debug("BigQuery query is: %s", query)
         return query
 
@@ -457,8 +471,8 @@ class TBigQuery(_Table):
         gb_column = self.get_groupby_column()
         bq_query = self.hash2_js_udf + "SELECT MOD( hash2(%s), %i) as bucket, %s, %s FROM %s " \
                                        "WHERE MOD( hash2(%s), %i) IN (%s)" \
-                                       % (gb_column, tc.number_of_group_by, gb_column, extra_columns_str,
-                                          self.full_name, gb_column, tc.number_of_group_by, buckets_values)
+                                       % (gb_column, self.tc.number_of_group_by, gb_column, extra_columns_str,
+                                          self.full_name, gb_column, self.tc.number_of_group_by, buckets_values)
         logging.debug("BQ query to show the buckets and the extra columns is: %s", bq_query)
 
         return bq_query
@@ -467,7 +481,7 @@ class TBigQuery(_Table):
         column_blocks = self.get_column_blocks(self.get_ddl_column())
         number_of_blocks = len(column_blocks)
         logging.debug("%i column_blocks (with a size of %i columns) have been considered: %s", number_of_blocks,
-                      tc.block_size, str(column_blocks))
+                      self.tc.block_size, str(column_blocks))
 
         # Generate the concatenations for the column_blocks
         bq_basic_shas = ""
@@ -483,7 +497,7 @@ class TBigQuery(_Table):
         bq_basic_shas = bq_basic_shas[:-2]
 
         bq_query = self.hash2_js_udf + "WITH blocks AS (\nSELECT MOD( hash2(%s), %i) as gb,\n%s\nFROM %s\n),\n" \
-                                       % (self.get_groupby_column(), tc.number_of_group_by, bq_basic_shas,
+                                       % (self.get_groupby_column(), self.tc.number_of_group_by, bq_basic_shas,
                                           self.full_name)  # 1st CTE with the basic block shas
         list_blocks = ", ".join(["block_%i" % i for i in range(number_of_blocks)])
         bq_query += "full_lines AS(\nSELECT gb, TO_BASE64( sha1( concat( %s))) as row_sha, %s FROM blocks\n)\n" \
@@ -495,6 +509,9 @@ class TBigQuery(_Table):
         logging.debug("##### Final BigQuery query is:\n%s\n", bq_query)
 
         return bq_query
+
+    def delete_temporary_table(self, table_name):
+        pass  # The temporary (cached) tables in BigQuery are deleted after 24 hours
 
     def query(self, query):
         """Execute the received query in BigQuery and return an iterate Result object
@@ -581,8 +598,8 @@ class TableComparator(object):
 
     def __init__(self):
         table = 'hive_compared_bq_table3'
-        self.tsrc = THive('sluangsay', table, 'b')
-        self.tdst = TBigQuery('bidwh2', table)
+        self.tsrc = THive('sluangsay', table, self, 'b')
+        self.tdst = TBigQuery('bidwh2', table, self)
         #  myDatabase = 'ldebruijn'
         #  myTable = 'PPP_retail_promotion_reference_group'
         #  myTable = 'PPP_retail_promotion'
@@ -670,7 +687,7 @@ class TableComparator(object):
         """
         if len(summary_differences) == 0:
             print "No differences where found when doing a Count on the tables %s and %s and grouping by on the " \
-                  "column %s" % (tc.tsrc.full_name, tc.tdst.full_name, tc.tsrc.get_groupby_column())
+                  "column %s" % (self.tsrc.full_name, self.tdst.full_name, self.tsrc.get_groupby_column())
             return True  # means that we should continue executing the script
 
         # We want to return at most 6 blocks of lines corresponding to different group by values. For the sake of
@@ -761,7 +778,10 @@ class TableComparator(object):
         tsrc_query = self.tsrc.create_sql_intermediate_checksums()
         tdst_query = self.tdst.create_sql_intermediate_checksums()
 
-        result = {"names_sha_tables": {}, "sha_dictionaries": {
+        # "cleaning" is for all the tables that will need to be eventually deleted. It must contain tuples (<name of
+        # table to delete>, corresponding _Table object). "names_sha_tables" contains all the temporary tables generated
+        # even the BigQuery cached table that does not need to be deleted. "sha_dictionaries" contains the results.
+        result = {"cleaning": [], "names_sha_tables": {}, "sha_dictionaries": {
             self.tsrc.get_id_string(): {},
             self.tdst.get_id_string(): {}
         }}
@@ -776,9 +796,9 @@ class TableComparator(object):
         t_src.join()
         t_dst.join()
 
-        if "error" in result:  # TODO we need to solve this problem later
-            if "hive" in result["names_sha_tables"]:
-                query_hive("DROP TABLE " + str(result["names_sha_tables"]["hive"])).close()
+        if "error" in result:
+            for table_name, table_object in result["cleaning"]:
+                table_object.delete_temporary_table(table_name)
             sys.exit(result["error"])
 
         # Comparing the results of those dictionaries
@@ -836,7 +856,7 @@ class TableComparator(object):
 
         # We want to find the column blocks that present most of the differences, and the bucket_rows associated to it
         blocks_most_differences = Counter()
-        column_blocks = _Table.get_column_blocks(self.tsrc.get_ddl_column())
+        column_blocks = self.tsrc.get_column_blocks(self.tsrc.get_ddl_column())
         map_colblocks_bucketrows = [[] for x in range(len(column_blocks))]
         for bucket_row, bq_blocks in dst_sha_lines.iteritems():
             hive_blocks = src_sha_lines[bucket_row]
@@ -899,23 +919,28 @@ class TableComparator(object):
         t_src.join()
         t_dst.join()
 
-        tc.display_html_diff(result, "/tmp/sha_diff")
+        self.display_html_diff(result, "/tmp/sha_diff")
 
         return False  # no need to execute the script further since errors have already been spotted
 
 
-logging.basicConfig(level=logging.DEBUG, format='[%(levelname)s]\t[%(asctime)s]  (%(threadName)-10s) %(message)s',)
+def main(argv):
+    tc = TableComparator()
 
-tc = TableComparator()
-diff, big_small = tc.compare_groupby_count()
-do_we_continue = tc.show_results_count(diff, big_small)
-if not do_we_continue:
-    sys.exit(1)
+    logging.basicConfig(level=logging.DEBUG, format='[%(levelname)s]\t[%(asctime)s]  (%(threadName)-10s) %(message)s',)
 
-sha_differences, temporary_tables = tc.compare_shas()
-if len(sha_differences) == 0:
-    print "Sha queries were done and no differences where found: the tables %s and %s are equal!" \
-          % (tc.tsrc.get_id_string(), tc.tdst.get_id_string())
-    sys.exit(0)
-queries = tc.get_sql_final_differences(sha_differences, temporary_tables)
-tc.show_results_final_differences(queries[0], queries[1])
+    diff, big_small = tc.compare_groupby_count()
+    do_we_continue = tc.show_results_count(diff, big_small)
+    if not do_we_continue:
+        sys.exit(1)
+
+    sha_differences, temporary_tables = tc.compare_shas()
+    if len(sha_differences) == 0:
+        print "Sha queries were done and no differences where found: the tables %s and %s are equal!" \
+              % (tc.tsrc.get_id_string(), tc.tdst.get_id_string())
+        sys.exit(0)
+    queries = tc.get_sql_final_differences(sha_differences, temporary_tables)
+    tc.show_results_final_differences(queries[0], queries[1])
+
+if __name__ == "__main__":
+    main(sys.argv)
