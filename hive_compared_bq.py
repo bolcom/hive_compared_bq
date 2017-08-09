@@ -1,7 +1,10 @@
+import argparse
+import ast
 import pyhs2
 import logging
 import threading
 import difflib
+import re
 import sys
 import time
 import webbrowser
@@ -22,11 +25,65 @@ class _Table(ABC):
         self.database = database
         self.table = table
         self.tc = parent
+        self.column_range = ":"
+        self.where_condition = None
         self.full_name = database + '.' + table
         self.connection = self._create_connection()
         self._ddl_columns = []  # array instead of dictionary because we want to maintain the order of the columns
         self._ddl_partitions = []  # take care, those rows also appear in the columns array
         self._group_by_column = None  # the column that is used to "bucket" the rows
+
+    @staticmethod
+    def create_table_from_string(argument, options, table_comparator):
+        """Parse an argument (usually received on the command line) and return the corresponding Table object
+
+        :type argument: str
+        :param argument: description of the table to connect to. Must have the format <type>/<database>.<table>
+                        type can be {hive,bq}
+
+        :type options: str
+        :param options: the dictionary of all the options for this table connection. Could be for instance:
+                         "{'jar': 'hdfs://hdp/user/sluangsay/lib/sha1.jar', 'hs2': 'master-003.bol.net'}"
+
+        :type table_comparator: :class:`TableComparator`
+        :param table_comparator: the TableComparator parent object, to have a reference to the configuration properties
+
+        :rtype: :class:`_Table`
+        :returns: the _Table object that corresponds to the argument
+
+        :raises: ValueError if the argument is void or does not match the format
+        """
+        match = re.match(r'(\w+)/(\w+)\.(\w+)', argument)
+        if match is None:
+            raise ValueError("Table description must follow the following format: '<type>/<database>.<table>'")
+
+        typedb = match.group(1)
+        database = match.group(2)
+        table = match.group(3)
+
+        hash_options = {}
+        if options is not None:
+            try:
+                hash_options = ast.literal_eval(options)
+            except:
+                raise ValueError("The option must be in a Python dictionary format (just like: {'jar': "
+                                 "'hdfs://hdp/user/sluangsay/lib/sha1.jar', 'hs2': 'master-003.bol.net'}\nThe value"
+                                 "received was: %s", options)
+
+        if typedb == "bq":
+            return TBigQuery(database, table, table_comparator)
+        elif typedb == "hive":
+            allowed_options = ["jar", "hs2"]
+            for key in hash_options:
+                if key not in allowed_options:
+                    raise ValueError("The following option for Hive is not supported: %s\nThe only supported options"
+                                     "are: %s", key, allowed_options)
+            if 'hs2' not in hash_options:
+                raise ValueError("hs2 option (Hive Server2 hostname) must be defined for Hive tables")
+
+            return THive(database, table, table_comparator, hash_options['hs2'], hash_options.get('jar'))
+        else:
+            raise ValueError("The database type %s is not implemented" % typedb)
 
     @abstractmethod
     def get_type(self):
@@ -36,6 +93,20 @@ class _Table(ABC):
     def get_id_string(self):
         """Return a string that fully identifies the table"""
         return self.get_type() + "_" + self.full_name
+
+    def set_where_condition(self, where):
+        """the WHERE condition we want to apply for the table. Could be useful in case of partitioned tables
+
+        :type where: str
+        :param where: the WHERE condition. Example: datedir="2017-05-01"
+        """
+        self.where_condition = where
+
+    def set_column_range(self, column_range):
+        self.column_range = column_range
+
+    def set_group_by_column(self, col):
+        self._group_by_column = col
 
     @abstractmethod
     def _create_connection(self):
@@ -196,7 +267,10 @@ class _Table(ABC):
         selected_columns = self.get_ddl_column()[:self.tc.sample_column_number]
         for col in selected_columns:
             query += " %s," % col["name"]  # for the last column we'll remove that trailing ","
-        query = query[:-1] + " FROM %s LIMIT %i" % (self.full_name, self.tc.sample_rows_number)
+        where_condition = ""
+        if self.where_condition is not None:
+            where_condition = "WHERE " + self.where_condition
+        query = query[:-1] + " FROM %s %s LIMIT %i" % (self.full_name, where_condition, self.tc.sample_rows_number)
         return query, selected_columns
 
     def get_column_blocks(self, ddl):
@@ -220,10 +294,10 @@ class _Table(ABC):
 class THive(_Table):
     """Hive implementation of the _Table object"""
 
-    def __init__(self, database, table, parent, cluster):
-        self.server = 'shd-hdp-' + cluster + '-master-003.bolcom.net'
+    def __init__(self, database, table, parent, hs2_server, jar_path):
+        self.server = hs2_server
         _Table.__init__(self, database, table, parent)
-        self.jarPath = 'hdfs://hdp-' + cluster + '/user/sluangsay/lib/sha1.jar'
+        self.jarPath = jar_path
 
     def get_type(self):
         return "hive"
@@ -238,6 +312,7 @@ class THive(_Table):
         is_col_def = True
         cur = self.connection.cursor()
         cur.execute("describe " + self.full_name)
+        all_columns = []
         while cur.hasMoreRows:
             row = cur.fetchone()  # TODO check if we should not do fetchall instead, or other fetch batch
             if row is None:
@@ -254,10 +329,27 @@ class THive(_Table):
 
             my_dic = {"name": col_name, "type": col_type}
             if is_col_def:
-                self._ddl_columns.append(my_dic)
+                all_columns.append(my_dic)
             else:
                 self._ddl_partitions.append(my_dic)
         cur.close()
+
+        if self.column_range == ":":
+            self._ddl_columns = all_columns
+        else:
+            match = re.match(r'(\d*):(\d*)', self.column_range)
+            if match is None:
+                raise ValueError("The column range must follow the Python style '1:9'. You gave: %s", self.column_range)
+
+            start = 0
+            if len(match.group(1)) > 0:
+                start = int(match.group(1))
+            end = len(all_columns)
+            if len(match.group(2)) > 0:
+                end = int(match.group(2))
+            self._ddl_columns = all_columns[start:end]
+            logging.debug("The range of columns has been reduced to: %s", self._ddl_columns)
+
         return self._ddl_columns
 
     def get_groupby_column(self):
@@ -278,7 +370,7 @@ class THive(_Table):
             if fetched is not None:
                 for idx, col in enumerate(selected_columns):
                     value_column = fetched[idx]
-                    col["Counter"][value_column] += 1  # TODO what happens with NULL?
+                    col["Counter"][value_column] += 1  # TODO what happens with NULL? (gives a problem with globalid)
         cur.close()
 
         #  Look at the statistics to estimate which column is the best to do a GROUP BY
@@ -308,18 +400,24 @@ class THive(_Table):
         return self._group_by_column
 
     def create_sql_groupby_count(self):
-        query = "SELECT hash( %s) %% %s AS gb, count(*) AS count FROM %s GROUP BY hash(%s) %% %i"\
-                % (self.get_groupby_column(), self.tc.number_of_group_by, self.full_name, self.get_groupby_column(),
-                   self.tc.number_of_group_by)
+        where_condition = ""
+        if self.where_condition is not None:
+            where_condition = "WHERE " + self.where_condition
+        query = "SELECT hash( %s) %% %s AS gb, count(*) AS count FROM %s %s GROUP BY hash(%s) %% %i"\
+                % (self.get_groupby_column(), self.tc.number_of_group_by, self.full_name, where_condition,
+                   self.get_groupby_column(), self.tc.number_of_group_by)
         logging.debug("Hive query is: %s", query)
 
         return query
 
     def create_sql_show_bucket_columns(self, extra_columns_str, buckets_values):
         gb_column = self.get_groupby_column()
-        hive_query = "SELECT hash(%s) %% %i as bucket, %s, %s FROM %s WHERE hash(%s) %% %i IN (%s)" \
-                     % (gb_column, self.tc.number_of_group_by, gb_column, extra_columns_str, self.full_name, gb_column,
-                        self.tc.number_of_group_by, buckets_values)
+        where_condition = ""
+        if self.where_condition is not None:
+            where_condition = self.where_condition + " AND"
+        hive_query = "SELECT hash(%s) %% %i as bucket, %s, %s FROM %s WHERE %s hash(%s) %% %i IN (%s)" \
+                     % (gb_column, self.tc.number_of_group_by, gb_column, extra_columns_str, self.full_name,
+                        where_condition, gb_column, self.tc.number_of_group_by, buckets_values)
         logging.debug("Hive query to show the buckets and the extra columns is: %s", hive_query)
 
         return hive_query
@@ -346,9 +444,13 @@ class THive(_Table):
             hive_basic_shas = hive_basic_shas[:-6] + ")))) as block_%i,\n" % idx
         hive_basic_shas = hive_basic_shas[:-2]
 
-        hive_query = "WITH blocks AS (\nSELECT hash(%s) %% %i as gb,\n%s\nFROM %s\n),\n" \
-                     % (self.get_groupby_column(), self.tc.number_of_group_by, hive_basic_shas, self.full_name)  # 1st
-        # CTE with the basic block shas
+        where_condition = ""
+        if self.where_condition is not None:
+            where_condition = "WHERE " + self.where_condition
+
+        hive_query = "WITH blocks AS (\nSELECT hash(%s) %% %i as gb,\n%s\nFROM %s %s\n),\n" \
+                     % (self.get_groupby_column(), self.tc.number_of_group_by, hive_basic_shas, self.full_name,
+                        where_condition)  # 1st CTE with the basic block shas
         list_blocks = ", ".join(["block_%i" % i for i in range(number_of_blocks)])
         hive_query += "full_lines AS(\nSELECT gb, base64( unhex( SHA1( concat( %s)))) as row_sha, %s FROM blocks\n)\n" \
                       % (list_blocks, list_blocks)  # 2nd CTE to get all the info of a row
@@ -372,22 +474,31 @@ class THive(_Table):
 
         :rtype: :class:`pyhs2.cursor.Cursor`
         :returns: the cursor for this query
+
+        :raises: IOError if the query has some execution errors
         """
         logging.debug("Launching Hive query")
-        cur = self.connection.cursor()
-        cur.execute(query)
+        try:
+            cur = self.connection.cursor()
+            cur.execute(query)
+        except:
+            raise IOError("There was a problem in executing the query in Hive: %s", sys.exc_info()[1])
         logging.debug("Fetching Hive results")
         return cur
 
     def launch_query_dict_result(self, query, result_dic, all_columns_from_2=False):
-        cur = self.query(query)
-        while cur.hasMoreRows:
-            row = cur.fetchone()
-            if row is not None:
-                if not all_columns_from_2:
-                    result_dic[row[0]] = row[1]
-                else:
-                    result_dic[row[0]] = row[2:]
+        try:
+            cur = self.query(query)
+            while cur.hasMoreRows:
+                row = cur.fetchone()
+                if row is not None:
+                    if not all_columns_from_2:
+                        result_dic[row[0]] = row[1]
+                    else:
+                        result_dic[row[0]] = row[2:]
+        except:
+            result_dic["error"] = sys.exc_info()[1]
+            raise
         logging.debug("All %i Hive rows fetched", len(result_dic))
         cur.close()
 
@@ -402,8 +513,12 @@ class THive(_Table):
         cur.close()
 
     def launch_query_with_intermediate_table(self, query, result):
-        cur = self.query("add jar " + self.jarPath)  # must be in a separated execution
-        cur.execute("create temporary function SHA1 as 'org.apache.hadoop.hive.ql.udf.UDFSha1'")
+        try:
+            cur = self.query("add jar " + self.jarPath)  # must be in a separated execution
+            cur.execute("create temporary function SHA1 as 'org.apache.hadoop.hive.ql.udf.UDFSha1'")
+        except:
+            result["error"] = sys.exc_info()[1]
+            raise
 
         if "error" in result:
             return  # let's stop the thread if some error popped up elsewhere
@@ -462,17 +577,25 @@ class TBigQuery(_Table):
         raise AttributeError("Not implemented yet for BigQuery since we have to receive the result from Hive")
 
     def create_sql_groupby_count(self):
-        query = self.hash2_js_udf + "SELECT MOD( hash2(%s), %i) as gb, count(*) as count FROM %s GROUP BY gb ORDER " \
-                                    "BY gb" % (self.get_groupby_column(), self.tc.number_of_group_by, self.full_name)
+        where_condition = ""
+        if self.where_condition is not None:
+            where_condition = "WHERE " + self.where_condition
+        query = self.hash2_js_udf + "SELECT MOD( hash2(%s), %i) as gb, count(*) as count FROM %s %s GROUP BY gb ORDER" \
+                                    " BY gb" % (self.get_groupby_column(), self.tc.number_of_group_by, self.full_name,
+                                                where_condition)
         logging.debug("BigQuery query is: %s", query)
         return query
 
     def create_sql_show_bucket_columns(self, extra_columns_str, buckets_values):
+        where_condition = ""
+        if self.where_condition is not None:
+            where_condition = self.where_condition + " AND"
         gb_column = self.get_groupby_column()
         bq_query = self.hash2_js_udf + "SELECT MOD( hash2(%s), %i) as bucket, %s, %s FROM %s " \
-                                       "WHERE MOD( hash2(%s), %i) IN (%s)" \
+                                       "WHERE %s MOD( hash2(%s), %i) IN (%s)" \
                                        % (gb_column, self.tc.number_of_group_by, gb_column, extra_columns_str,
-                                          self.full_name, gb_column, self.tc.number_of_group_by, buckets_values)
+                                          self.full_name, where_condition, gb_column, self.tc.number_of_group_by,
+                                          buckets_values)
         logging.debug("BQ query to show the buckets and the extra columns is: %s", bq_query)
 
         return bq_query
@@ -496,9 +619,13 @@ class TBigQuery(_Table):
             bq_basic_shas = bq_basic_shas[:-6] + "))) as block_%i,\n" % idx
         bq_basic_shas = bq_basic_shas[:-2]
 
-        bq_query = self.hash2_js_udf + "WITH blocks AS (\nSELECT MOD( hash2(%s), %i) as gb,\n%s\nFROM %s\n),\n" \
+        where_condition = ""
+        if self.where_condition is not None:
+            where_condition = "WHERE " + self.where_condition
+
+        bq_query = self.hash2_js_udf + "WITH blocks AS (\nSELECT MOD( hash2(%s), %i) as gb,\n%s\nFROM %s %s\n),\n" \
                                        % (self.get_groupby_column(), self.tc.number_of_group_by, bq_basic_shas,
-                                          self.full_name)  # 1st CTE with the basic block shas
+                                          self.full_name, where_condition)  # 1st CTE with the basic block shas
         list_blocks = ", ".join(["block_%i" % i for i in range(number_of_blocks)])
         bq_query += "full_lines AS(\nSELECT gb, TO_BASE64( sha1( concat( %s))) as row_sha, %s FROM blocks\n)\n" \
                     % (list_blocks, list_blocks)  # 2nd CTE to get all the info of a row
@@ -597,12 +724,8 @@ class TableComparator(object):
     """Represent the general configuration of the program (tables names, number of rows to scan...) """
 
     def __init__(self):
-        table = 'hive_compared_bq_table3'
-        self.tsrc = THive('sluangsay', table, self, 'b')
-        self.tdst = TBigQuery('bidwh2', table, self)
-        #  myDatabase = 'ldebruijn'
-        #  myTable = 'PPP_retail_promotion_reference_group'
-        #  myTable = 'PPP_retail_promotion'
+        self.tsrc = None
+        self.tdst = None
 
         # 10 000 rows should be good enough to use as a sample
         #  (Google uses some sample of 1000 or 3000 rows)
@@ -610,8 +733,7 @@ class TableComparator(object):
         #  (based on estimation : rows * columns * ( size string + int) * overhead Counter )
         self.sample_rows_number = 10000
         self.sample_column_number = 10
-        self.max_percent_most_frequent_value_in_column = 1  # if in one sample a column has a value whose frequency is
-        # highest than this percentage, then this column is discarded
+        self.max_percent_most_frequent_value_in_column = None
         self.number_of_most_frequent_values_to_weight = 50
 
         self.number_of_group_by = 100000  # 7999 is the limit if you want to manually download the data from BQ. This
@@ -620,6 +742,33 @@ class TableComparator(object):
         # lines per bucket
         self.block_size = 5  # 5 columns means that when we want to debug we have enough context. But it small enough to
         #  avoid being charged too much by Google when querying on it
+
+    def set_tsrc(self, table):
+        """Set the source table to be compared
+
+        :type table: :class:`_Table`
+        :param table: the _Table object
+        """
+        self.tsrc = table
+
+    def set_tdst(self, table):
+        """Set the destination table to be compared
+
+        :type table: :class:`_Table`
+        :param table: the _Table object
+        """
+        self.tdst = table
+
+    def set_max_percent_most_frequent_value_in_column(self, percent):
+        """Set the max_percent_most_frequent_value_in_column value
+
+        If in one sample a column has a value whose frequency is highest than this percentage, then this column is not
+        considered as a suitable column to do the Group By
+
+        :type percent: float
+        :param percent: the percentage value
+        """
+        self.max_percent_most_frequent_value_in_column = percent
 
     def compare_groupby_count(self):
         """Runs a light query on Hive and BigQuery to check if the counts match, using the ideal column estimated before
@@ -633,9 +782,6 @@ class TableComparator(object):
         logging.info("Executing the 'Group By' Count queries for %s (%s) and %s (%s) to do first comparison",
                      self.tsrc.full_name, self.tsrc.get_type(), self.tdst.full_name, self.tdst.get_type())
         src_query = self.tsrc.create_sql_groupby_count()
-        self.tdst._group_by_column = self.tsrc.get_groupby_column()  # the Group By must use the same column
-        self.tdst._ddl_columns = self.tsrc.get_ddl_column()  # TODO we should have the same with BQ and have
-        # a check DDL comparation
         dst_query = self.tdst.create_sql_groupby_count()
 
         result = {"src_count_dict": {}, "dst_count_dict": {}}
@@ -647,6 +793,10 @@ class TableComparator(object):
         t_dst.start()
         t_src.join()
         t_dst.join()
+
+        for k in result:
+            if 'error' in result[k]:
+                sys.exit(result[k]["error"])
 
         # #### Let's compare the count between the 2 Group By queries
         # iterate on biggest dictionary so that we're sure to se a difference if there is one
@@ -923,24 +1073,118 @@ class TableComparator(object):
 
         return False  # no need to execute the script further since errors have already been spotted
 
+    def synchronise_tables(self):
+        """Ensure that some specific properties between the 2 tables have the same values, like the Group By column"""
+        self.tdst._ddl_columns = self.tsrc.get_ddl_column()  # TODO we should have the same with BQ and have
+        # a check DDL comparison
+        self.tdst._group_by_column = self.tsrc.get_groupby_column()  # the Group By must use the same column for both
+        # tables
 
-def main(argv):
-    tc = TableComparator()
+    def perform_step_count(self):
+        """Execute the Count comparison of the 2 tables
 
-    logging.basicConfig(level=logging.DEBUG, format='[%(levelname)s]\t[%(asctime)s]  (%(threadName)-10s) %(message)s',)
+        :rtype: bool
+        :returns: True if we haven't found differences yet and further analysis is needed
+        """
+        self.synchronise_tables()
+        diff, big_small = self.compare_groupby_count()
+        return self.show_results_count(diff, big_small)
 
-    diff, big_small = tc.compare_groupby_count()
-    do_we_continue = tc.show_results_count(diff, big_small)
-    if not do_we_continue:
+    def perform_step_sha(self):
+        """Execute the Sha comparison of the 2 tables"""
+        self.synchronise_tables()
+        sha_differences, temporary_tables = self.compare_shas()
+        if len(sha_differences) == 0:
+            print "Sha queries were done and no differences where found: the tables %s and %s are equal!" \
+                  % (self.tsrc.get_id_string(), self.tdst.get_id_string())
+            sys.exit(0)
+        queries = self.get_sql_final_differences(sha_differences, temporary_tables)
+        self.show_results_final_differences(queries[0], queries[1])
         sys.exit(1)
 
-    sha_differences, temporary_tables = tc.compare_shas()
-    if len(sha_differences) == 0:
-        print "Sha queries were done and no differences where found: the tables %s and %s are equal!" \
-              % (tc.tsrc.get_id_string(), tc.tdst.get_id_string())
-        sys.exit(0)
-    queries = tc.get_sql_final_differences(sha_differences, temporary_tables)
-    tc.show_results_final_differences(queries[0], queries[1])
+
+def parse_arguments():
+    """Parse the arguments received on the command line and returns the args element of argparse"""  # TODO return objec
+    parser = argparse.ArgumentParser(description="Compare table <source> with table <destination>",
+                                     formatter_class=argparse.RawTextHelpFormatter)
+    parser.add_argument("source", help="the original (correct version) table\n"
+                                       "The format must have the following format: <type>/<database>.<table>\n"
+                                       "<type> can be: bq or hive\n ")
+    parser.add_argument("destination", help="the destination table that needs to be compared\n"
+                                            "Format follows the one for the source table")
+
+    parser.add_argument("-s", "--source-options", help="options for the source table\nFor Hive that could be: {'jar': "
+                                                       "'hdfs://hdp/user/sluangsay/lib/sha1.jar', 'hs2': "
+                                                       "'master-003.bol.net'}")
+    parser.add_argument("-d", "--destination-options", help="options for the destination table")
+
+    parser.add_argument("--source-where", help="the WHERE condition we want to apply for the source table\n"
+                                               "Could be useful in case of partitioned tables\n"
+                                               "Example: \"datedir='2017-05-01'\"")
+    parser.add_argument("--destination-where", help="the WHERE condition we want to apply for the destination table")
+
+    parser.add_argument("--max-gb-percent", type=float, default=1.0,
+                        help="if in one sample a column has a value whose frequency is highest than this percentage, "
+                             "then this column is discarded (default: 1.0)")
+
+    parser.add_argument("--column-range", default=":",
+                        help="Instead of checking all the columns, you can define a range of columns to check\n"
+                             "This works as a Python array-range. Meaning that if you want to only analyze the first "
+                             "20 columns, you need to give:\n :20")
+
+    parser.add_argument("--group-by-column", help="the column in argument is enforced to be the Group By column")
+
+    group_step = parser.add_mutually_exclusive_group()
+    group_step.add_argument("--just-count", help="only perform the Count check", action="store_true")
+    group_step.add_argument("--just-sha", help="only perform the final sha check", action="store_true")
+
+    group_log = parser.add_mutually_exclusive_group()
+    group_log.add_argument("-v", "--verbose", help="show debug information", action="store_true")
+    group_log.add_argument("-q", "--quiet", help="only show important information", action="store_true")
+
+    # self.max_percent_most_frequent_value_in_column = 1  # if in one sample a column has a value whose frequency is
+    # highest than this percentage, then this column is discarded
+
+    # TODO put mode to just select columns, to exclude, to partition, to choose the size of the blocks, the columns
+    # for the Group By etc
+
+    return parser.parse_args()
+
+
+def main():
+    args = parse_arguments()
+
+    level_logging = logging.INFO
+    if args.verbose:
+        level_logging = logging.DEBUG
+    elif args.quiet:
+        level_logging = logging.WARNING
+    logging.basicConfig(level=level_logging, format='[%(levelname)s]\t[%(asctime)s]  (%(threadName)-10s) %(message)s', )
+
+    logging.debug("Starting comparison program with arguments: %s", args)
+
+    # Create the TableComparator that contains the definition of the 2 tables we want to compare
+    tc = TableComparator()
+    tc.set_max_percent_most_frequent_value_in_column(args.max_gb_percent)
+    source_table = _Table.create_table_from_string(args.source, args.source_options, tc)
+    destination_table = _Table.create_table_from_string(args.destination, args.destination_options, tc)
+    source_table.set_where_condition(args.source_where)
+    destination_table.set_where_condition(args.destination_where)
+    source_table.set_column_range(args.column_range)
+    destination_table.set_column_range(args.column_range)
+    source_table.set_group_by_column(args.group_by_column)  # if not defined, then it's None and we'll compute it later
+    tc.set_tsrc(source_table)
+    tc.set_tdst(destination_table)
+
+    # Step: count
+    if not args.just_sha:
+        do_we_continue = tc.perform_step_count()
+        if not do_we_continue:
+            sys.exit(1)
+
+    # Step: sha
+    if not args.just_count:
+        tc.perform_step_sha()
 
 if __name__ == "__main__":
-    main(sys.argv)
+    main()
