@@ -403,7 +403,7 @@ class THive(_Table):
         where_condition = ""
         if self.where_condition is not None:
             where_condition = "WHERE " + self.where_condition
-        query = "SELECT hash( %s) %% %s AS gb, count(*) AS count FROM %s %s GROUP BY hash(%s) %% %i"\
+        query = "SELECT hash( %s) %% %i AS gb, count(*) AS count FROM %s %s GROUP BY hash(%s) %% %i"\
                 % (self.get_groupby_column(), self.tc.number_of_group_by, self.full_name, where_condition,
                    self.get_groupby_column(), self.tc.number_of_group_by)
         logging.debug("Hive query is: %s", query)
@@ -478,8 +478,11 @@ class THive(_Table):
         :raises: IOError if the query has some execution errors
         """
         logging.debug("Launching Hive query")
+        #  split_maxsize = 256000000
+        split_maxsize = 64000000
         try:
             cur = self.connection.cursor()
+            cur.execute("set mapreduce.input.fileinputformat.split.maxsize = %i" % split_maxsize)
             cur.execute(query)
         except:
             raise IOError("There was a problem in executing the query in Hive: %s", sys.exc_info()[1])
@@ -740,6 +743,14 @@ class TableComparator(object):
         # limit does not apply in this script because we fetch the data with the Python API instead.
         #  TODO ideally this limit would be dynamic (counting the total rows), in order to get an average of 7
         # lines per bucket
+        self.skew_threshold = 40000  # if we detect that a Group By has more than this amount of rows
+        # (compare_groupby_count() method), then we raise an exception, because the computation of the shas (which is
+        # computationally expensive) might suffer a lot from this skew, and might also trigger some OOM exception.
+        # 40 000 seems a safe number:
+        # Let's consider a table with many column: 1000 columns. That means 201 sha blocks (1000 / 5 + 1)
+        # a sha is 29 characters
+        # so the max memory with a skew of 40 000 would be:
+        # 201 * 40000 * 29 / 1024 /1024 = 222 MB, which should fit into the Heap of a task process
         self.block_size = 5  # 5 columns means that when we want to debug we have enough context. But it small enough to
         #  avoid being charged too much by Google when querying on it
 
@@ -772,6 +783,9 @@ class TableComparator(object):
 
     def compare_groupby_count(self):
         """Runs a light query on Hive and BigQuery to check if the counts match, using the ideal column estimated before
+
+        Some skew detection is also performed here. And the program stops if we detect some important skew and no
+        difference was detected (meaning that the sha computation would have been performed with that skew).
 
         :rtype: tuple
         :returns: ``(summary_differences, big_small_bucket)``, where ``summary_differences`` is a list of tuples,
@@ -809,16 +823,31 @@ class TableComparator(object):
             big_dict = result["dst_count_dict"]
             small_dict = result["src_count_dict"]
             big_small_bucket = (self.tdst, self.tsrc)
+
         differences = Counter()
+        skew = Counter()
         for (k, v) in big_dict.iteritems():
             if k not in small_dict:
                 differences[k] = -v  # we want to see the differences where we have less lines to compare
             elif v != small_dict[k]:
                 differences[k] = -v - small_dict[k]
+            # we check the skew even if some differences were found above and we will never enter the sha computation,
+            # so that the developer can fix at early stage
+            max_value = max(v, small_dict.get(k))
+            if max_value > self.skew_threshold:
+                skew[k] = max_value
         summary_differences = [(k, -v, big_dict[k]) for (k, v) in differences.most_common()]
+        if len(skew) > 0:
+            logging.warning("Some important skew (threshold: %i) was detected in the Group By column %s. The top values"
+                            " are: %s", self.skew_threshold, self.tsrc.get_groupby_column(), str(skew.most_common(10)))
+            if len(summary_differences) == 0:
+                sys.exit("No difference in Group By count was detected but we saw some important skew that could make"
+                         "the next step (comparison of the shas) very slow or failing. So better stopping now. You"
+                         "should consider choosing another Group By column with the '--group-by-column' option")
         if len(summary_differences) != 0:
             logging.info("We found at least %i differences in Group By count", len(summary_differences))
             logging.debug("Differences in Group By count are: %s", summary_differences[:300])
+
         return summary_differences, big_small_bucket
 
     def show_results_count(self, summary_differences, big_small_bucket):
@@ -1132,7 +1161,9 @@ def parse_arguments():
                              "This works as a Python array-range. Meaning that if you want to only analyze the first "
                              "20 columns, you need to give:\n :20")
 
-    parser.add_argument("--group-by-column", help="the column in argument is enforced to be the Group By column")
+    parser.add_argument("--group-by-column",
+                        help="the column in argument is enforced to be the Group By column. Can be useful if the sample"
+                             "query does not manage to find a good Group By column and we need to avoid some skew")
 
     group_step = parser.add_mutually_exclusive_group()
     group_step.add_argument("--just-count", help="only perform the Count check", action="store_true")
@@ -1142,11 +1173,7 @@ def parse_arguments():
     group_log.add_argument("-v", "--verbose", help="show debug information", action="store_true")
     group_log.add_argument("-q", "--quiet", help="only show important information", action="store_true")
 
-    # self.max_percent_most_frequent_value_in_column = 1  # if in one sample a column has a value whose frequency is
-    # highest than this percentage, then this column is discarded
-
-    # TODO put mode to just select columns, to exclude, to partition, to choose the size of the blocks, the columns
-    # for the Group By etc
+    # TODO put mode to just select columns, to exclude, to partition, to choose the size of the blocks, etc
 
     return parser.parse_args()
 
