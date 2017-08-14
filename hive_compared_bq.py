@@ -16,18 +16,47 @@ ABC = ABCMeta('ABC', (object,), {})  # compatible with Python 2 *and* 3
 
 
 class _Table(ABC):
-    """"Represent an abstract table that contains database connection and the related SQL executions"""
+    """Represent an abstract table that contains database connection and the related SQL executions
+
+    :type database: str
+    :param database: Name of the database
+
+    :type table: str
+    :param table: Name of the table
+
+    :type tc: :class:`TableComparator`
+    :param tc: reference to the parent object, in order to access the configuration
+
+    :type column_range: str
+    :param column_range: Python array range that represents the range of columns in the DDL that we want to compare
+
+    :type where_condition: str
+    :param where_condition: boolean SQL condition that will be added to the WHERE condition of all the queries for that
+                            table, so that we can restrict the analysis to a specific scope. Also quite useful when
+                            we want to work on specific partitions.
+
+    :type table: str
+    :param table: Name of the table
+
+    :type table: str
+    :param table: Name of the table
+
+    """
     # TODO more description
 
     __metaclass__ = ABCMeta
 
     def __init__(self, database, table, parent):
+        """"Represent an abstract table that contains database connection and the related SQL executions"""
         self.database = database
         self.table = table
         self.tc = parent
         self.column_range = ":"
+        self.chosen_columns = None  # list of the (str) columns we want to focus on.
         self.where_condition = None
+        """str: Docstring *after* attribute, with type specified."""
         self.full_name = database + '.' + table
+        #: list of str: Doc comment *before* attribute, with type specified
         self.connection = self._create_connection()
         self._ddl_columns = []  # array instead of dictionary because we want to maintain the order of the columns
         self._ddl_partitions = []  # take care, those rows also appear in the columns array
@@ -105,6 +134,9 @@ class _Table(ABC):
     def set_column_range(self, column_range):
         self.column_range = column_range
 
+    def set_chosen_columns(self, cols):
+        self.chosen_columns = cols.split(",")
+
     def set_group_by_column(self, col):
         self._group_by_column = col
 
@@ -114,7 +146,7 @@ class _Table(ABC):
         pass
 
     @abstractmethod
-    def get_ddl_column(self):
+    def get_ddl_columns(self):
         """ Return the columns of this table
 
         The list of the column is an attribute of the class. If it already exists, then it is directly returns.
@@ -264,7 +296,7 @@ class _Table(ABC):
                     list of columns that are fetched
         """
         query = "SELECT"
-        selected_columns = self.get_ddl_column()[:self.tc.sample_column_number]
+        selected_columns = self.get_ddl_columns()[:self.tc.sample_column_number]
         for col in selected_columns:
             query += " %s," % col["name"]  # for the last column we'll remove that trailing ","
         where_condition = ""
@@ -305,7 +337,7 @@ class THive(_Table):
     def _create_connection(self):
         return pyhs2.connect(host=self.server, port=10000, authMechanism="KERBEROS", database=self.database)
 
-    def get_ddl_column(self):
+    def get_ddl_columns(self):
         if len(self._ddl_columns) > 0:
             return self._ddl_columns
 
@@ -335,8 +367,18 @@ class THive(_Table):
         cur.close()
 
         if self.column_range == ":":
-            self._ddl_columns = all_columns
-        else:
+            if self.chosen_columns is not None:  # user has declared the columns he wants to analyze
+                leftover = list(self.chosen_columns)
+                for col in all_columns:
+                    if col['name'] in leftover:
+                        leftover.remove(col['name'])
+                        self._ddl_columns.append(col)
+                if len(leftover) > 0:
+                    sys.exit("Error: you asked to analyze the columns %s but we could not find them in the table %s"
+                             % (str(leftover), self.get_id_string()))
+            else:
+                self._ddl_columns = all_columns
+        else:  # user has requested a specific range of columns
             match = re.match(r'(\d*):(\d*)', self.column_range)
             if match is None:
                 raise ValueError("The column range must follow the Python style '1:9'. You gave: %s", self.column_range)
@@ -370,7 +412,7 @@ class THive(_Table):
             if fetched is not None:
                 for idx, col in enumerate(selected_columns):
                     value_column = fetched[idx]
-                    col["Counter"][value_column] += 1  # TODO what happens with NULL? (gives a problem with globalid)
+                    col["Counter"][value_column] += 1  # TODO what happens with NULL? (case of globalid in Omniture)
         cur.close()
 
         #  Look at the statistics to estimate which column is the best to do a GROUP BY
@@ -393,6 +435,9 @@ class THive(_Table):
                 self._group_by_column = col["name"]
                 minimum_weight = weight_of_most_frequent_values
                 highest_first = highest[1]
+        if self._group_by_column is None:
+            sys.exit("Error: we could not find a suitable column to do a Group By. Either relax the selection condition"
+                     " with the '--max-gb-percent' option or directly select the column with '--group-by-column' ")
         logging.info("Best column to do a GROUP BY is %s (apparitions of most frequent value: %i / the %i most frequent"
                      "values sum up %i apparitions)", self._group_by_column, highest_first,
                      self.tc.number_of_most_frequent_values_to_weight, minimum_weight)
@@ -403,7 +448,8 @@ class THive(_Table):
         where_condition = ""
         if self.where_condition is not None:
             where_condition = "WHERE " + self.where_condition
-        query = "SELECT hash( %s) %% %i AS gb, count(*) AS count FROM %s %s GROUP BY hash(%s) %% %i"\
+        query = "SELECT hash( cast( %s as STRING)) %% %i AS gb, count(*) AS count FROM %s %s GROUP BY " \
+                "hash( cast( %s as STRING)) %% %i" \
                 % (self.get_groupby_column(), self.tc.number_of_group_by, self.full_name, where_condition,
                    self.get_groupby_column(), self.tc.number_of_group_by)
         logging.debug("Hive query is: %s", query)
@@ -415,7 +461,8 @@ class THive(_Table):
         where_condition = ""
         if self.where_condition is not None:
             where_condition = self.where_condition + " AND"
-        hive_query = "SELECT hash(%s) %% %i as bucket, %s, %s FROM %s WHERE %s hash(%s) %% %i IN (%s)" \
+        hive_query = "SELECT hash( cast( %s as STRING)) %% %i as bucket, %s, %s FROM %s WHERE %s " \
+                     "hash( cast( %s as STRING)) %% %i IN (%s)" \
                      % (gb_column, self.tc.number_of_group_by, gb_column, extra_columns_str, self.full_name,
                         where_condition, gb_column, self.tc.number_of_group_by, buckets_values)
         logging.debug("Hive query to show the buckets and the extra columns is: %s", hive_query)
@@ -423,7 +470,7 @@ class THive(_Table):
         return hive_query
 
     def create_sql_intermediate_checksums(self):
-        column_blocks = self.get_column_blocks(self.get_ddl_column())
+        column_blocks = self.get_column_blocks(self.get_ddl_columns())
         number_of_blocks = len(column_blocks)
         logging.debug("%i column_blocks (with a size of %i columns) have been considered: %s", number_of_blocks,
                       self.tc.block_size, str(column_blocks))
@@ -448,7 +495,7 @@ class THive(_Table):
         if self.where_condition is not None:
             where_condition = "WHERE " + self.where_condition
 
-        hive_query = "WITH blocks AS (\nSELECT hash(%s) %% %i as gb,\n%s\nFROM %s %s\n),\n" \
+        hive_query = "WITH blocks AS (\nSELECT hash( cast( %s as STRING)) %% %i as gb,\n%s\nFROM %s %s\n),\n" \
                      % (self.get_groupby_column(), self.tc.number_of_group_by, hive_basic_shas, self.full_name,
                         where_condition)  # 1st CTE with the basic block shas
         list_blocks = ", ".join(["block_%i" % i for i in range(number_of_blocks)])
@@ -479,7 +526,9 @@ class THive(_Table):
         """
         logging.debug("Launching Hive query")
         #  split_maxsize = 256000000
-        split_maxsize = 64000000
+        # split_maxsize = 64000000
+        # split_maxsize = 8000000
+        split_maxsize = 16000000
         try:
             cur = self.connection.cursor()
             cur.execute("set mapreduce.input.fileinputformat.split.maxsize = %i" % split_maxsize)
@@ -568,7 +617,7 @@ class TBigQuery(_Table):
     def _create_connection(self):
         return bigquery.Client()
 
-    def get_ddl_column(self):
+    def get_ddl_columns(self):
         if len(self._ddl_columns) > 0:
             return self._ddl_columns
         else:
@@ -583,9 +632,10 @@ class TBigQuery(_Table):
         where_condition = ""
         if self.where_condition is not None:
             where_condition = "WHERE " + self.where_condition
-        query = self.hash2_js_udf + "SELECT MOD( hash2(%s), %i) as gb, count(*) as count FROM %s %s GROUP BY gb ORDER" \
-                                    " BY gb" % (self.get_groupby_column(), self.tc.number_of_group_by, self.full_name,
-                                                where_condition)
+        query = self.hash2_js_udf + "SELECT MOD( hash2( cast(%s as STRING)), %i) as gb, count(*) as count FROM %s %s " \
+                                    "GROUP BY gb ORDER BY gb" \
+                                    % (self.get_groupby_column(), self.tc.number_of_group_by, self.full_name,
+                                       where_condition)
         logging.debug("BigQuery query is: %s", query)
         return query
 
@@ -594,8 +644,8 @@ class TBigQuery(_Table):
         if self.where_condition is not None:
             where_condition = self.where_condition + " AND"
         gb_column = self.get_groupby_column()
-        bq_query = self.hash2_js_udf + "SELECT MOD( hash2(%s), %i) as bucket, %s, %s FROM %s " \
-                                       "WHERE %s MOD( hash2(%s), %i) IN (%s)" \
+        bq_query = self.hash2_js_udf + "SELECT MOD( hash2( cast(%s as STRING)), %i) as bucket, %s, %s FROM %s " \
+                                       "WHERE %s MOD( hash2( cast(%s as STRING)), %i) IN (%s)" \
                                        % (gb_column, self.tc.number_of_group_by, gb_column, extra_columns_str,
                                           self.full_name, where_condition, gb_column, self.tc.number_of_group_by,
                                           buckets_values)
@@ -604,7 +654,7 @@ class TBigQuery(_Table):
         return bq_query
 
     def create_sql_intermediate_checksums(self):
-        column_blocks = self.get_column_blocks(self.get_ddl_column())
+        column_blocks = self.get_column_blocks(self.get_ddl_columns())
         number_of_blocks = len(column_blocks)
         logging.debug("%i column_blocks (with a size of %i columns) have been considered: %s", number_of_blocks,
                       self.tc.block_size, str(column_blocks))
@@ -626,7 +676,8 @@ class TBigQuery(_Table):
         if self.where_condition is not None:
             where_condition = "WHERE " + self.where_condition
 
-        bq_query = self.hash2_js_udf + "WITH blocks AS (\nSELECT MOD( hash2(%s), %i) as gb,\n%s\nFROM %s %s\n),\n" \
+        bq_query = self.hash2_js_udf + "WITH blocks AS (\nSELECT MOD( hash2( cast(%s as STRING)), %i) as gb,\n%s\n" \
+                                       "FROM %s %s\n),\n" \
                                        % (self.get_groupby_column(), self.tc.number_of_group_by, bq_basic_shas,
                                           self.full_name, where_condition)  # 1st CTE with the basic block shas
         list_blocks = ", ".join(["block_%i" % i for i in range(number_of_blocks)])
@@ -654,7 +705,7 @@ class TBigQuery(_Table):
         """
         logging.debug("Launching BigQuery query")
         q = self.connection.run_sync_query(query)
-        q.timeout_ms = 60000  # 1 minute to execute the query in BQ should be more than enough
+        q.timeout_ms = 600000  # 10 minute to execute the query in BQ should be more than enough. 1 minute was too short
         # TODO use maxResults https://cloud.google.com/bigquery/docs/reference/rest/v2/jobs/query? :
         q.use_legacy_sql = False
         q.run()
@@ -683,7 +734,7 @@ class TBigQuery(_Table):
         job.use_legacy_sql = False
         job.begin()
         time.sleep(3)  # 3 second is the minimum latency we get in BQ in general. So no need to try fetching before
-        retry_count = 30  # 1 minute (should be enough)
+        retry_count = 300  # 10 minute (should be enough)
         while retry_count > 0 and job.state != 'DONE':
             retry_count -= 1
             time.sleep(2)
@@ -770,6 +821,14 @@ class TableComparator(object):
         """
         self.tdst = table
 
+    def set_skew_threshold(self, threshold):
+        """Set the threshold value for the skew
+
+        :type threshold: int
+        :param threshold: the threshold value (default: 40 000)
+        """
+        self.skew_threshold = threshold
+
     def set_max_percent_most_frequent_value_in_column(self, percent):
         """Set the max_percent_most_frequent_value_in_column value
 
@@ -830,7 +889,7 @@ class TableComparator(object):
             if k not in small_dict:
                 differences[k] = -v  # we want to see the differences where we have less lines to compare
             elif v != small_dict[k]:
-                differences[k] = -v - small_dict[k]
+                differences[k] = - abs(v - small_dict[k])
             # we check the skew even if some differences were found above and we will never enter the sha computation,
             # so that the developer can fix at early stage
             max_value = max(v, small_dict.get(k))
@@ -870,7 +929,7 @@ class TableComparator(object):
             return True  # means that we should continue executing the script
 
         # We want to return at most 6 blocks of lines corresponding to different group by values. For the sake of
-        # brevity, each block should not show more than 40 lines. Blocks that show rows only on 1 table should be
+        # brevity, each block should not show more than 70 lines. Blocks that show rows only on 1 table should be
         # limited to 3 (so that we can see "context" when debugging). To also give context, we will show some few other
         # columns.
         number_buckets_only_one_table = 0
@@ -879,13 +938,13 @@ class TableComparator(object):
         buckets_smalltable = []
         bigtable = big_small_bucket[0]
         smalltable = big_small_bucket[1]
-        for (bucket, total, biggest_num) in summary_differences:
-            if total > 40:
+        for (bucket, difference_num, biggest_num) in summary_differences:
+            if difference_num > 70:
                 break  # since the Counter was ordered from small differences to biggest, we know that this difference
                 # number can only increase. So let's go out of the loop
-            if biggest_num + (biggest_num - total) > 40:  # "biggest_num - total" = number of lines in small dictionary
+            if biggest_num > 70:
                 continue
-            if total == biggest_num:
+            if difference_num == biggest_num:
                 if number_buckets_only_one_table == 3:
                     continue
                 else:
@@ -900,15 +959,20 @@ class TableComparator(object):
                 number_buckets_found += 1
                 if number_buckets_found == 6:
                     break
+        if len(buckets_bigtable) == 0:  # let's ensure that we have at least 1 value to show
+            (bucket, difference_num, biggest_num) = summary_differences[0]
+            buckets_bigtable.append(bucket)
+            if difference_num != biggest_num:
+                buckets_smalltable.append(bucket)
         logging.debug("Buckets for %s: %s \t\tBuckets for %s: %s", bigtable.full_name, str(buckets_bigtable),
                       smalltable.full_name, str(buckets_smalltable))
 
         gb_column = self.tsrc.get_groupby_column()
-        extra_columns = [x["name"] for x in self.tsrc.get_ddl_column()[:6]]  # add 5 extra columns to see some context
+        extra_columns = [x["name"] for x in self.tsrc.get_ddl_columns()[:6]]  # add 5 extra columns to see some context
         if gb_column in extra_columns:
             extra_columns.remove(gb_column)
-        else:
-            extra_columns = extra_columns[:-1]
+        elif len(extra_columns) == 6:
+            extra_columns = extra_columns[:-1]  # limit to 5 columns
         extra_columns_str = str(extra_columns)[1:-1].replace("'", "")
         bigtable_query = bigtable.create_sql_show_bucket_columns(extra_columns_str, str(buckets_bigtable)[1:-1])
         smalltable_query = smalltable.create_sql_show_bucket_columns(extra_columns_str, str(buckets_smalltable)[1:-1])
@@ -932,9 +996,11 @@ class TableComparator(object):
             with open(sorted_file[instance], "w") as f:
                 f.write("\n".join(result[instance]))
 
-        # TODO put the names of the columns in the 'file name', so that it's easy to debug
-        diff_string = difflib.HtmlDiff().make_file(result["big_rows"], result["small_rows"], bigtable.get_id_string(),
-                                                   smalltable.get_id_string(), context=False, numlines=30)
+        column_description = "</br>hash(%s) , %s , %s" \
+                             % (bigtable.get_groupby_column(), bigtable.get_groupby_column(), extra_columns_str)
+        diff_string = difflib.HtmlDiff().make_file(result["big_rows"], result["small_rows"], bigtable.get_id_string() +
+                                                   column_description, smalltable.get_id_string() + column_description,
+                                                   context=False, numlines=30)
         html_file = "/tmp/count_diff.html"
         with open(html_file, "w") as f:
             f.write(diff_string)
@@ -943,7 +1009,7 @@ class TableComparator(object):
         webbrowser.open("file://" + html_file, new=2)
         return False  # no need to execute the script further since errors have already been spotted
 
-    def compare_shas(self):  # TODO doc
+    def compare_shas(self):
         """Runs the final queries on Hive and BigQuery to check if the checksum match and return the list of differences
 
         :rtype: tuple
@@ -1013,6 +1079,7 @@ class TableComparator(object):
         :rtype: tuple of str
         :returns: ``(hive_final_sql, bq_final_sql)``, the queries to be executed to do the final debugging
         """
+        # TODO doc list_column_to_check
         subset_differences = str(differences[:8])[1:-1]  # we will just show some few (8) differences
         logging.debug("The sha differences that we consider are: %s", str(subset_differences))
 
@@ -1035,12 +1102,12 @@ class TableComparator(object):
 
         # We want to find the column blocks that present most of the differences, and the bucket_rows associated to it
         blocks_most_differences = Counter()
-        column_blocks = self.tsrc.get_column_blocks(self.tsrc.get_ddl_column())
+        column_blocks = self.tsrc.get_column_blocks(self.tsrc.get_ddl_columns())
         map_colblocks_bucketrows = [[] for x in range(len(column_blocks))]
-        for bucket_row, bq_blocks in dst_sha_lines.iteritems():
-            hive_blocks = src_sha_lines[bucket_row]
-            for idx, sha in enumerate(bq_blocks):
-                if sha != hive_blocks[idx]:
+        for bucket_row, dst_blocks in dst_sha_lines.iteritems():
+            src_blocks = src_sha_lines[bucket_row]
+            for idx, sha in enumerate(dst_blocks):
+                if sha != src_blocks[idx]:
                     blocks_most_differences[idx] += 1
                     map_colblocks_bucketrows[idx].append(bucket_row)
         logging.debug("Block columns with most differences are: %s. Which correspond to those bucket rows: %s",
@@ -1055,10 +1122,19 @@ class TableComparator(object):
         dst_final_sql = self.tdst.create_sql_show_bucket_columns(list_column_to_check, list_hashs)
         logging.debug("Final source query is: %s   -   Final dest query is: %s", src_final_sql, dst_final_sql)
 
-        return src_final_sql, dst_final_sql
+        return src_final_sql, dst_final_sql, list_column_to_check
 
     @staticmethod
-    def display_html_diff(result, file_name):  # TODO doc
+    def display_html_diff(result, file_name, col_description):
+        """Show the difference of the analysis in a graphical webpage
+
+         :type result: dict
+         :param result: dictionary that contains the hashMaps of some of the rows with differences between the 2 tables
+
+         :type file_name: str
+         :param file_name: prefix of the path where will be written the temporary files
+         """
+        # TODO doc
         sorted_file = {}
         keys = result.keys()
         for instance in keys:
@@ -1067,9 +1143,8 @@ class TableComparator(object):
             with open(sorted_file[instance], "w") as f:
                 f.write("\n".join(result[instance]))
 
-        # TODO put the names of the columns in the 'file name', so that it's easy to debug
-        diff_html = difflib.HtmlDiff().make_file(result[keys[0]], result[keys[1]], keys[0], keys[1], context=False,
-                                                 numlines=30)
+        diff_html = difflib.HtmlDiff().make_file(result[keys[0]], result[keys[1]], keys[0] + col_description, keys[1]
+                                                 + col_description, context=False,numlines=30)
         html_file = file_name + ".html"
         with open(html_file, "w") as f:
             f.write(diff_html)
@@ -1077,7 +1152,7 @@ class TableComparator(object):
                       sorted_file[keys[0]], sorted_file[keys[1]], html_file)
         webbrowser.open("file://" + html_file, new=2)
 
-    def show_results_final_differences(self, src_sql, dst_sql):
+    def show_results_final_differences(self, src_sql, dst_sql, list_extra_columns):
         """If any differences found in the shas analysis step, then show them in a webpage
 
         :type src_sql: str
@@ -1086,6 +1161,7 @@ class TableComparator(object):
         :type dst_sql: str
         :param dst_sql: the query of the destination table to launch to see the rows that are different
         """
+        # TODO doc
         src_id = self.tsrc.get_id_string()
         dst_id = self.tdst.get_id_string()
         result = {src_id: [], dst_id: []}
@@ -1098,13 +1174,16 @@ class TableComparator(object):
         t_src.join()
         t_dst.join()
 
-        self.display_html_diff(result, "/tmp/sha_diff")
+        col_description = "</br>hash(%s) , %s , %s" \
+                          % (self.tsrc.get_groupby_column(), self.tsrc.get_groupby_column(), list_extra_columns)
+
+        self.display_html_diff(result, "/tmp/sha_diff", col_description)
 
         return False  # no need to execute the script further since errors have already been spotted
 
     def synchronise_tables(self):
         """Ensure that some specific properties between the 2 tables have the same values, like the Group By column"""
-        self.tdst._ddl_columns = self.tsrc.get_ddl_column()  # TODO we should have the same with BQ and have
+        self.tdst._ddl_columns = self.tsrc.get_ddl_columns()  # TODO we should have the same with BQ and have
         # a check DDL comparison
         self.tdst._group_by_column = self.tsrc.get_groupby_column()  # the Group By must use the same column for both
         # tables
@@ -1128,12 +1207,16 @@ class TableComparator(object):
                   % (self.tsrc.get_id_string(), self.tdst.get_id_string())
             sys.exit(0)
         queries = self.get_sql_final_differences(sha_differences, temporary_tables)
-        self.show_results_final_differences(queries[0], queries[1])
+        self.show_results_final_differences(queries[0], queries[1], queries[2])
         sys.exit(1)
 
 
 def parse_arguments():
-    """Parse the arguments received on the command line and returns the args element of argparse"""  # TODO return objec
+    """Parse the arguments received on the command line and returns the args element of argparse
+
+    :rtype: namespace
+    :returns: The object that contains all the configuration of the command line
+    """
     parser = argparse.ArgumentParser(description="Compare table <source> with table <destination>",
                                      formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("source", help="the original (correct version) table\n"
@@ -1156,10 +1239,18 @@ def parse_arguments():
                         help="if in one sample a column has a value whose frequency is highest than this percentage, "
                              "then this column is discarded (default: 1.0)")
 
-    parser.add_argument("--column-range", default=":",
-                        help="Instead of checking all the columns, you can define a range of columns to check\n"
-                             "This works as a Python array-range. Meaning that if you want to only analyze the first "
-                             "20 columns, you need to give:\n :20")
+    parser.add_argument("--skew-threshold", type=int,
+                        help="increase the threshold (default: 40 000) if you have some skew but if the amount of"
+                             "columns is reduced so that you feel confident that all the shas will fit into memory")
+
+    group_columns = parser.add_mutually_exclusive_group()
+    group_columns.add_argument("--column-range", default=":",
+                               help="Instead of checking all the columns, you can define a range of columns to check\n"
+                                    "This works as a Python array-range. Meaning that if you want to only analyze the "
+                                    "first 20 columns, you need to give:\n :20")
+    group_columns.add_argument("--columns",
+                               help="Instead of checking all the columns, you can give here the list of the columns you"
+                                    " want to check. Example: 'column1,column14,column23'")
 
     parser.add_argument("--group-by-column",
                         help="the column in argument is enforced to be the Group By column. Can be useful if the sample"
@@ -1199,7 +1290,12 @@ def main():
     destination_table.set_where_condition(args.destination_where)
     source_table.set_column_range(args.column_range)
     destination_table.set_column_range(args.column_range)
+    if args.columns is not None:
+        source_table.set_chosen_columns(args.columns)
+        destination_table.set_chosen_columns(args.columns)
     source_table.set_group_by_column(args.group_by_column)  # if not defined, then it's None and we'll compute it later
+    if args.skew_threshold is not None:
+        tc.set_skew_threshold(args.skew_threshold)
     tc.set_tsrc(source_table)
     tc.set_tdst(destination_table)
 
