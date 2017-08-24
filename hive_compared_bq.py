@@ -46,13 +46,14 @@ class _Table(ABC):
 
     __metaclass__ = ABCMeta
 
-    def __init__(self, database, table, parent):
+    def __init__(self, database, table, parent, *args, **kwargs):
         """"Represent an abstract table that contains database connection and the related SQL executions"""
         self.database = database
         self.table = table
         self.tc = parent
         self.column_range = ":"
         self.chosen_columns = None  # list of the (str) columns we want to focus on.
+        self.ignore_columns = None
         self.where_condition = None
         """str: Docstring *after* attribute, with type specified."""
         self.full_name = database + '.' + table
@@ -136,6 +137,9 @@ class _Table(ABC):
 
     def set_chosen_columns(self, cols):
         self.chosen_columns = cols.split(",")
+
+    def set_ignore_columns(self, cols):
+        self.ignore_columns = cols.split(",")
 
     def set_group_by_column(self, col):
         self._group_by_column = col
@@ -392,6 +396,13 @@ class THive(_Table):
             self._ddl_columns = all_columns[start:end]
             logging.debug("The range of columns has been reduced to: %s", self._ddl_columns)
 
+        if self.ignore_columns is not None:
+            all_columns = []
+            for col in self._ddl_columns:
+                if not col['name'] in self.ignore_columns:
+                    all_columns.append(col)
+            self._ddl_columns = list(all_columns)
+
         return self._ddl_columns
 
     def get_groupby_column(self):
@@ -484,8 +495,8 @@ class THive(_Table):
                 hive_value_name = name
                 if col["type"] == 'date':
                     hive_value_name = "cast( %s as STRING)" % name
-                elif "decimal" in col["type"]:  # aligning formatting of Decimal types in Hive with Float in BQ
-                    hive_value_name = 'regexp_replace( %s, "\\.0$", "")' % name
+                elif col["type"] == 'string' and name == 'allexceptbooks':  # TODO unhardcode this name value
+                    hive_value_name = "DecodeCP1252( %s)" % name
                 hive_basic_shas += "CASE WHEN %s IS NULL THEN 'n_%s' ELSE %s END, '|'," % (name, name[:2],
                                                                                            hive_value_name)
             hive_basic_shas = hive_basic_shas[:-6] + ")))) as block_%i,\n" % idx
@@ -568,6 +579,8 @@ class THive(_Table):
         try:
             cur = self.query("add jar " + self.jarPath)  # must be in a separated execution
             cur.execute("create temporary function SHA1 as 'org.apache.hadoop.hive.ql.udf.UDFSha1'")
+            cur.execute("create temporary function DecodeCP1252 as "
+                        "'org.apache.hadoop.hive.ql.udf.generic.GenericUDFRemoveControlChar'")  # TODO change class name
         except:
             result["error"] = sys.exc_info()[1]
             raise
@@ -644,7 +657,7 @@ class TBigQuery(_Table):
         if self.where_condition is not None:
             where_condition = self.where_condition + " AND"
         gb_column = self.get_groupby_column()
-        bq_query = self.hash2_js_udf + "SELECT MOD( hash2( cast(%s as STRING)), %i) as bucket, %s, %s FROM %s " \
+        bq_query = self.hash2_js_udf + "SELECT MOD( hash2( cast(%s as STRING)), %i) as bucket, %s as gb, %s FROM %s " \
                                        "WHERE %s MOD( hash2( cast(%s as STRING)), %i) IN (%s)" \
                                        % (gb_column, self.tc.number_of_group_by, gb_column, extra_columns_str,
                                           self.full_name, where_condition, gb_column, self.tc.number_of_group_by,
@@ -666,7 +679,9 @@ class TBigQuery(_Table):
             for col in block:
                 name = col["name"]
                 bq_value_name = name
-                if not col["type"] == 'string':
+                if col["type"] == 'decimal':  # removing trailing & unnecessary 'zero decimal' (*.0)
+                    bq_value_name = 'regexp_replace( %s, "\\.0$", "")' % name
+                elif not col["type"] == 'string':
                     bq_value_name = "cast( %s as STRING)" % name
                 bq_basic_shas += "CASE WHEN %s IS NULL THEN 'n_%s' ELSE %s END, '|'," % (name, name[:2], bq_value_name)
             bq_basic_shas = bq_basic_shas[:-6] + "))) as block_%i,\n" % idx
@@ -804,6 +819,9 @@ class TableComparator(object):
         # 201 * 40000 * 29 / 1024 /1024 = 222 MB, which should fit into the Heap of a task process
         self.block_size = 5  # 5 columns means that when we want to debug we have enough context. But it small enough to
         #  avoid being charged too much by Google when querying on it
+
+        reload(sys)
+        sys.setdefaultencoding('utf-8')
 
     def set_tsrc(self, table):
         """Set the source table to be compared
@@ -1047,7 +1065,7 @@ class TableComparator(object):
             sys.exit(result["error"])
 
         # Comparing the results of those dictionaries
-        logging.debug("Searching differences in Group By")
+        logging.debug("Searching differences in Shas")
         src_num_gb = len(result["sha_dictionaries"][self.tsrc.get_id_string()])
         dst_num_gb = len(result["sha_dictionaries"][self.tdst.get_id_string()])
         if not src_num_gb == dst_num_gb:
@@ -1064,7 +1082,7 @@ class TableComparator(object):
                 list_differences.append(k)
         if len(list_differences) != 0:
             logging.info("We found %i differences in sha verification", len(list_differences))
-            logging.debug("Differences in Group By count are: %s", list_differences[:300])
+            logging.debug("Differences in sha are: %s", list_differences[:300])
         return list_differences, result["names_sha_tables"]
 
     def get_sql_final_differences(self, differences, temp_tables):
@@ -1078,9 +1096,13 @@ class TableComparator(object):
 
         :rtype: tuple of str
         :returns: ``(hive_final_sql, bq_final_sql)``, the queries to be executed to do the final debugging
+
+        :raises: IOError if the query has some execution errors
         """
         # TODO doc list_column_to_check
-        subset_differences = str(differences[:8])[1:-1]  # we will just show some few (8) differences
+        subset_differences = str(differences[:3000])[1:-1]  # let's choose quite a big number (instead of just looking
+        # at some few (5 for instance) differences for 2 reasons: 1) by fetching more rows we will find estimate
+        # better which column blocks fail often 2) we have less possibilities to face some 'permutations' problems
         logging.debug("The sha differences that we consider are: %s", str(subset_differences))
 
         src_query = "SELECT * FROM %s WHERE gb IN (%s)" % (temp_tables[self.tsrc.get_id_string()], subset_differences)
@@ -1097,8 +1119,6 @@ class TableComparator(object):
         t_dst.start()
         t_src.join()
         t_dst.join()
-        logging.debug("The 8 sha lines for %s are: %s. The 8 sha lines for %s are: %s", self.tsrc.get_id_string(),
-                      src_sha_lines, self.tdst.get_id_string(), dst_sha_lines)
 
         # We want to find the column blocks that present most of the differences, and the bucket_rows associated to it
         blocks_most_differences = Counter()
@@ -1113,10 +1133,24 @@ class TableComparator(object):
         logging.debug("Block columns with most differences are: %s. Which correspond to those bucket rows: %s",
                       blocks_most_differences, map_colblocks_bucketrows)
 
-        block_most_different = blocks_most_differences.most_common(1)[0][0]  # TODO we should check if we have enough
+        # collisions could happen for instance with those 2 "rows" (1st column is the Group BY value, 2nd column is the
+        # value of a column in the data, 3rd column is the value of another column which belongs to another 'block
+        # column' than the 2nd one):
+        # ## SRC table:
+        # bucket1   1   A
+        # bucket1   0   B
+        # ## DST table:
+        # bucket1   0   A
+        # bucket1   1   B
+        # In such case, the 'grouped sha of each column' will be always the same. But the sha-lines will be different
+        if len(blocks_most_differences) == 0:
+            raise RuntimeError("Program faced some collisions when trying to assess which blocks of columns were not"
+                               "correct. Please contact the developer to ask for a fix")
+        block_most_different = blocks_most_differences.most_common(1)[0][0]
         # buckets otherwise we might want to take a second block
         list_column_to_check = " ,".join([x["name"] for x in column_blocks[block_most_different]])
-        list_hashs = " ,".join(map(str, map_colblocks_bucketrows[block_most_different]))
+        # let's display just 10 buckets in error max
+        list_hashs = " ,".join(map(str, map_colblocks_bucketrows[block_most_different][:10]))
 
         src_final_sql = self.tsrc.create_sql_show_bucket_columns(list_column_to_check, list_hashs)
         dst_final_sql = self.tdst.create_sql_show_bucket_columns(list_column_to_check, list_hashs)
@@ -1144,7 +1178,7 @@ class TableComparator(object):
                 f.write("\n".join(result[instance]))
 
         diff_html = difflib.HtmlDiff().make_file(result[keys[0]], result[keys[1]], keys[0] + col_description, keys[1]
-                                                 + col_description, context=False,numlines=30)
+                                                 + col_description, context=True, numlines=15)
         html_file = file_name + ".html"
         with open(html_file, "w") as f:
             f.write(diff_html)
@@ -1252,6 +1286,11 @@ def parse_arguments():
                                help="Instead of checking all the columns, you can give here the list of the columns you"
                                     " want to check. Example: 'column1,column14,column23'")
 
+    parser.add_argument("--ignore-columns",
+                        help="the column in argument will be ignored from analysis. Example: 'column1,column14,"
+                             "column23'")  # not in the group_columns, because we want to be able to ask for a range
+    # of columns but removing some few at the same time
+
     parser.add_argument("--group-by-column",
                         help="the column in argument is enforced to be the Group By column. Can be useful if the sample"
                              "query does not manage to find a good Group By column and we need to avoid some skew")
@@ -1264,9 +1303,23 @@ def parse_arguments():
     group_log.add_argument("-v", "--verbose", help="show debug information", action="store_true")
     group_log.add_argument("-q", "--quiet", help="only show important information", action="store_true")
 
-    # TODO put mode to just select columns, to exclude, to partition, to choose the size of the blocks, etc
+    # TODO put mode to partition, to choose the size of the blocks, etc
 
     return parser.parse_args()
+
+
+def create_table_from_args(definition, options, where, args, tc):
+    # TODO doc
+    table = _Table.create_table_from_string(definition, options, tc)
+    table.set_where_condition(where)
+    table.set_column_range(args.column_range)
+    if args.columns is not None:
+        table.set_chosen_columns(args.columns)
+    if args.ignore_columns is not None:
+        table.set_ignore_columns(args.ignore_columns)
+    table.set_group_by_column(args.group_by_column)  # if not defined, then it's None and we'll compute it later
+
+    return table
 
 
 def main():
@@ -1284,16 +1337,9 @@ def main():
     # Create the TableComparator that contains the definition of the 2 tables we want to compare
     tc = TableComparator()
     tc.set_max_percent_most_frequent_value_in_column(args.max_gb_percent)
-    source_table = _Table.create_table_from_string(args.source, args.source_options, tc)
-    destination_table = _Table.create_table_from_string(args.destination, args.destination_options, tc)
-    source_table.set_where_condition(args.source_where)
-    destination_table.set_where_condition(args.destination_where)
-    source_table.set_column_range(args.column_range)
-    destination_table.set_column_range(args.column_range)
-    if args.columns is not None:
-        source_table.set_chosen_columns(args.columns)
-        destination_table.set_chosen_columns(args.columns)
-    source_table.set_group_by_column(args.group_by_column)  # if not defined, then it's None and we'll compute it later
+    source_table = create_table_from_args(args.source, args.source_options, args.source_where, args,tc)
+    destination_table = create_table_from_args(args.destination, args.destination_options, args.destination_where,
+                                               args,tc)
     if args.skew_threshold is not None:
         tc.set_skew_threshold(args.skew_threshold)
     tc.set_tsrc(source_table)
