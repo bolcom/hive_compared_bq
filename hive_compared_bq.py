@@ -1088,6 +1088,10 @@ class TableComparator(object):
     def get_sql_final_differences(self, differences, temp_tables):
         """Return the queries to get the real data for the differences found in the last compare_shas() step
 
+        From the compare_shas step, we know all the rowBuckets that present some differences. The goal of this
+        function is to identify which columnsBuckets have those differences, so that we can show to the developer
+        only the rows and the columns in error. We will focus on the columns that present most of the errors.
+
         :type differences: list of str
         :param differences: the list of Group By values which present different row checksums
 
@@ -1095,11 +1099,11 @@ class TableComparator(object):
         :param temp_tables: contains the names of the temporary tables ["hive", "bq"]
 
         :rtype: tuple of str
-        :returns: ``(hive_final_sql, bq_final_sql)``, the queries to be executed to do the final debugging
+        :returns: ``(hive_final_sql, bq_final_sql, list_column_to_check)``, the queries to be executed to do the final
+                    debugging, and the name of the columns that are fetched.
 
         :raises: IOError if the query has some execution errors
         """
-        # TODO doc list_column_to_check
         subset_differences = str(differences[:3000])[1:-1]  # let's choose quite a big number (instead of just looking
         # at some few (5 for instance) differences for 2 reasons: 1) by fetching more rows we will find estimate
         # better which column blocks fail often 2) we have less possibilities to face some 'permutations' problems
@@ -1194,8 +1198,11 @@ class TableComparator(object):
 
         :type dst_sql: str
         :param dst_sql: the query of the destination table to launch to see the rows that are different
+
+        :type list_extra_columns: str
+        :param list_extra_columns: list (',' separated) of the extra columns that will be shown in the differences.
+                This parameter is only used to show the description in the web page.
         """
-        # TODO doc
         src_id = self.tsrc.get_id_string()
         dst_id = self.tdst.get_id_string()
         result = {src_id: [], dst_id: []}
