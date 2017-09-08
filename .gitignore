@@ -1,0 +1,4 @@
+.idea
+launch.sh
+*.swp
+*.pyc
