@@ -1,16 +1,18 @@
 import argparse
 import ast
-import pyhs2
 import logging
 import threading
 import difflib
 import re
 import sys
-import time
 import webbrowser
 from abc import ABCMeta, abstractmethod
-from collections import Counter
-from google.cloud import bigquery
+
+if sys.version_info[0:2] == (2, 6):
+    # noinspection PyUnresolvedReferences
+    from backport_collections import Counter
+else:
+    from collections import Counter
 
 ABC = ABCMeta('ABC', (object,), {})  # compatible with Python 2 *and* 3
 
@@ -101,6 +103,7 @@ class _Table(ABC):
                                  "received was: %s", options)
 
         if typedb == "bq":
+            from bq import TBigQuery
             return TBigQuery(database, table, table_comparator)
         elif typedb == "hive":
             allowed_options = ["jar", "hs2"]
@@ -111,6 +114,7 @@ class _Table(ABC):
             if 'hs2' not in hash_options:
                 raise ValueError("hs2 option (Hive Server2 hostname) must be defined for Hive tables")
 
+            from hive import THive  # TODO check best practice
             return THive(database, table, table_comparator, hash_options['hs2'], hash_options.get('jar'))
         else:
             raise ValueError("The database type %s is not implemented" % typedb)
@@ -320,473 +324,11 @@ class _Table(ABC):
         """
         column_blocks = []
         for idx, col in enumerate(ddl):
-            block_id = idx / self.tc.block_size
+            block_id = idx // self.tc.block_size
             if idx % self.tc.block_size == 0:
                 column_blocks.append([])
             column_blocks[block_id].append({"name": col["name"], "type": col["type"]})
         return column_blocks
-
-
-class THive(_Table):
-    """Hive implementation of the _Table object"""
-
-    def __init__(self, database, table, parent, hs2_server, jar_path):
-        self.server = hs2_server
-        _Table.__init__(self, database, table, parent)
-        self.jarPath = jar_path
-
-    def get_type(self):
-        return "hive"
-
-    def _create_connection(self):
-        return pyhs2.connect(host=self.server, port=10000, authMechanism="KERBEROS", database=self.database)
-
-    def get_ddl_columns(self):
-        if len(self._ddl_columns) > 0:
-            return self._ddl_columns
-
-        is_col_def = True
-        cur = self.connection.cursor()
-        cur.execute("describe " + self.full_name)
-        all_columns = []
-        while cur.hasMoreRows:
-            row = cur.fetchone()  # TODO check if we should not do fetchall instead, or other fetch batch
-            if row is None:
-                continue
-            col_name = row[0]
-            col_type = row[1]
-
-            if col_name == "" or col_name == "None":
-                continue
-            if col_name.startswith('#'):
-                if "Partition Information" in col_name:
-                    is_col_def = False
-                continue
-
-            my_dic = {"name": col_name, "type": col_type}
-            if is_col_def:
-                all_columns.append(my_dic)
-            else:
-                self._ddl_partitions.append(my_dic)
-        cur.close()
-
-        if self.column_range == ":":
-            if self.chosen_columns is not None:  # user has declared the columns he wants to analyze
-                leftover = list(self.chosen_columns)
-                for col in all_columns:
-                    if col['name'] in leftover:
-                        leftover.remove(col['name'])
-                        self._ddl_columns.append(col)
-                if len(leftover) > 0:
-                    sys.exit("Error: you asked to analyze the columns %s but we could not find them in the table %s"
-                             % (str(leftover), self.get_id_string()))
-            else:
-                self._ddl_columns = all_columns
-        else:  # user has requested a specific range of columns
-            match = re.match(r'(\d*):(\d*)', self.column_range)
-            if match is None:
-                raise ValueError("The column range must follow the Python style '1:9'. You gave: %s", self.column_range)
-
-            start = 0
-            if len(match.group(1)) > 0:
-                start = int(match.group(1))
-            end = len(all_columns)
-            if len(match.group(2)) > 0:
-                end = int(match.group(2))
-            self._ddl_columns = all_columns[start:end]
-            logging.debug("The range of columns has been reduced to: %s", self._ddl_columns)
-
-        if self.ignore_columns is not None:
-            all_columns = []
-            for col in self._ddl_columns:
-                if not col['name'] in self.ignore_columns:
-                    all_columns.append(col)
-            self._ddl_columns = list(all_columns)
-
-        return self._ddl_columns
-
-    def get_groupby_column(self):
-        if self._group_by_column is not None:
-            return self._group_by_column
-
-        query, selected_columns = self.get_sample_query()
-
-        #  Get a sample from the table and fill Counters to each column
-        logging.info("Analyzing the columns %s with a sample of %i values", str([x["name"] for x in selected_columns]),
-                     self.tc.sample_rows_number)
-        for col in selected_columns:
-            col["Counter"] = Counter()
-        cur = self.connection.cursor()
-        cur.execute(query)
-        while cur.hasMoreRows:
-            fetched = cur.fetchone()
-            if fetched is not None:
-                for idx, col in enumerate(selected_columns):
-                    value_column = fetched[idx]
-                    col["Counter"][value_column] += 1  # TODO what happens with NULL? (case of globalid in Omniture)
-        cur.close()
-
-        #  Look at the statistics to estimate which column is the best to do a GROUP BY
-        max_frequent_number = self.tc.sample_rows_number * self.tc.max_percent_most_frequent_value_in_column / 100
-        minimum_weight = sys.maxint
-        highest_first = max_frequent_number
-        for col in selected_columns:
-            highest = col["Counter"].most_common(1)[0]
-            if highest[1] > max_frequent_number:
-                logging.debug(
-                    "Discarding column '%s' because '%s' was found in sample %i times (higher than limit of %i)",
-                    col["name"], highest[0], highest[1], max_frequent_number)
-                continue
-            # The biggest value is not too high, so let's see how big are the 50 biggest values
-            weight_of_most_frequent_values = sum([x[1] for x in col["Counter"]
-                                                 .most_common(self.tc.number_of_most_frequent_values_to_weight)])
-            logging.debug("%s: sum up of the %i most frequent apparitions: %i", col["name"],
-                          self.tc.number_of_most_frequent_values_to_weight, weight_of_most_frequent_values)
-            if weight_of_most_frequent_values < minimum_weight:
-                self._group_by_column = col["name"]
-                minimum_weight = weight_of_most_frequent_values
-                highest_first = highest[1]
-        if self._group_by_column is None:
-            sys.exit("Error: we could not find a suitable column to do a Group By. Either relax the selection condition"
-                     " with the '--max-gb-percent' option or directly select the column with '--group-by-column' ")
-        logging.info("Best column to do a GROUP BY is %s (apparitions of most frequent value: %i / the %i most frequent"
-                     "values sum up %i apparitions)", self._group_by_column, highest_first,
-                     self.tc.number_of_most_frequent_values_to_weight, minimum_weight)
-
-        return self._group_by_column
-
-    def create_sql_groupby_count(self):
-        where_condition = ""
-        if self.where_condition is not None:
-            where_condition = "WHERE " + self.where_condition
-        query = "SELECT hash( cast( %s as STRING)) %% %i AS gb, count(*) AS count FROM %s %s GROUP BY " \
-                "hash( cast( %s as STRING)) %% %i" \
-                % (self.get_groupby_column(), self.tc.number_of_group_by, self.full_name, where_condition,
-                   self.get_groupby_column(), self.tc.number_of_group_by)
-        logging.debug("Hive query is: %s", query)
-
-        return query
-
-    def create_sql_show_bucket_columns(self, extra_columns_str, buckets_values):
-        gb_column = self.get_groupby_column()
-        where_condition = ""
-        if self.where_condition is not None:
-            where_condition = self.where_condition + " AND"
-        hive_query = "SELECT hash( cast( %s as STRING)) %% %i as bucket, %s, %s FROM %s WHERE %s " \
-                     "hash( cast( %s as STRING)) %% %i IN (%s)" \
-                     % (gb_column, self.tc.number_of_group_by, gb_column, extra_columns_str, self.full_name,
-                        where_condition, gb_column, self.tc.number_of_group_by, buckets_values)
-        logging.debug("Hive query to show the buckets and the extra columns is: %s", hive_query)
-
-        return hive_query
-
-    def create_sql_intermediate_checksums(self):
-        column_blocks = self.get_column_blocks(self.get_ddl_columns())
-        number_of_blocks = len(column_blocks)
-        logging.debug("%i column_blocks (with a size of %i columns) have been considered: %s", number_of_blocks,
-                      self.tc.block_size, str(column_blocks))
-
-        # Generate the concatenations for the column_blocks
-        hive_basic_shas = ""
-        for idx, block in enumerate(column_blocks):
-            hive_basic_shas += "base64( unhex( SHA1( concat( "
-            for col in block:
-                name = col["name"]
-                hive_value_name = name
-                if col["type"] == 'date':
-                    hive_value_name = "cast( %s as STRING)" % name
-                elif col["type"] == 'string' and name == 'allexceptbooks':  # TODO unhardcode this name value
-                    hive_value_name = "DecodeCP1252( %s)" % name
-                hive_basic_shas += "CASE WHEN %s IS NULL THEN 'n_%s' ELSE %s END, '|'," % (name, name[:2],
-                                                                                           hive_value_name)
-            hive_basic_shas = hive_basic_shas[:-6] + ")))) as block_%i,\n" % idx
-        hive_basic_shas = hive_basic_shas[:-2]
-
-        where_condition = ""
-        if self.where_condition is not None:
-            where_condition = "WHERE " + self.where_condition
-
-        hive_query = "WITH blocks AS (\nSELECT hash( cast( %s as STRING)) %% %i as gb,\n%s\nFROM %s %s\n),\n" \
-                     % (self.get_groupby_column(), self.tc.number_of_group_by, hive_basic_shas, self.full_name,
-                        where_condition)  # 1st CTE with the basic block shas
-        list_blocks = ", ".join(["block_%i" % i for i in range(number_of_blocks)])
-        hive_query += "full_lines AS(\nSELECT gb, base64( unhex( SHA1( concat( %s)))) as row_sha, %s FROM blocks\n)\n" \
-                      % (list_blocks, list_blocks)  # 2nd CTE to get all the info of a row
-        hive_list_shas = ", ".join(["base64( unhex( SHA1( concat_ws( '|', sort_array( collect_list( block_%i)))))) as "
-                                    "block_%i_gb " % (i, i) for i in range(number_of_blocks)])
-        hive_query += "SELECT gb, base64( unhex( SHA1( concat_ws( '|', sort_array( collect_list( row_sha)))))) as " \
-                      "row_sha_gb, %s FROM full_lines GROUP BY gb" % hive_list_shas  # final query where all the shas
-        # are grouped by row-blocks
-        logging.debug("##### Final Hive query is:\n%s\n", hive_query)
-
-        return hive_query
-
-    def delete_temporary_table(self, table_name):
-        self.query_hive("DROP TABLE " + table_name).close()
-
-    def query(self, query):
-        """Execute the received query in Hive and return the cursor which is ready to be fetched and MUST be closed after
-
-        :type query: str
-        :param query: query to execute in Hive
-
-        :rtype: :class:`pyhs2.cursor.Cursor`
-        :returns: the cursor for this query
-
-        :raises: IOError if the query has some execution errors
-        """
-        logging.debug("Launching Hive query")
-        #  split_maxsize = 256000000
-        # split_maxsize = 64000000
-        # split_maxsize = 8000000
-        split_maxsize = 16000000
-        try:
-            cur = self.connection.cursor()
-            cur.execute("set mapreduce.input.fileinputformat.split.maxsize = %i" % split_maxsize)
-            cur.execute(query)
-        except:
-            raise IOError("There was a problem in executing the query in Hive: %s", sys.exc_info()[1])
-        logging.debug("Fetching Hive results")
-        return cur
-
-    def launch_query_dict_result(self, query, result_dic, all_columns_from_2=False):
-        try:
-            cur = self.query(query)
-            while cur.hasMoreRows:
-                row = cur.fetchone()
-                if row is not None:
-                    if not all_columns_from_2:
-                        result_dic[row[0]] = row[1]
-                    else:
-                        result_dic[row[0]] = row[2:]
-        except:
-            result_dic["error"] = sys.exc_info()[1]
-            raise
-        logging.debug("All %i Hive rows fetched", len(result_dic))
-        cur.close()
-
-    def launch_query_csv_compare_result(self, query, rows):
-        cur = self.query(query)
-        while cur.hasMoreRows:
-            row = cur.fetchone()
-            if row is not None:
-                line = "^ " + " | ".join([str(col) for col in row]) + " $"
-                rows.append(line)
-        logging.debug("All %i Hive rows fetched", len(rows))
-        cur.close()
-
-    def launch_query_with_intermediate_table(self, query, result):
-        try:
-            cur = self.query("add jar " + self.jarPath)  # must be in a separated execution
-            cur.execute("create temporary function SHA1 as 'org.apache.hadoop.hive.ql.udf.UDFSha1'")
-            cur.execute("create temporary function DecodeCP1252 as "
-                        "'org.apache.hadoop.hive.ql.udf.generic.GenericUDFRemoveControlChar'")  # TODO change class name
-        except:
-            result["error"] = sys.exc_info()[1]
-            raise
-
-        if "error" in result:
-            return  # let's stop the thread if some error popped up elsewhere
-
-        tmp_table = "%s.temporary_hive_compared_bq_%s" % (self.database, str(time.time()).replace('.', '_'))
-        cur.execute("CREATE TABLE " + tmp_table + " AS\n" + query)
-        cur.close()
-        result["names_sha_tables"][self.get_id_string()] = tmp_table  # we confirm this table has been created
-        result["cleaning"] = (tmp_table, self)
-
-        print "The temporary table for Hive is %s. REMEMBER to delete it when you've finished doing the analysis!" \
-              % tmp_table
-
-        if "error" in result:  # A problem happened in BQ so there is no need to pursue or have the temp table
-            return
-
-        projection_hive_row_sha = "SELECT gb, row_sha_gb FROM %s" % tmp_table
-        self.launch_query_dict_result(projection_hive_row_sha, result["sha_dictionaries"][self.get_id_string()])
-
-
-class TBigQuery(_Table):
-    """BigQuery implementation of the _Table object"""
-
-    hash2_js_udf = '''create temp function hash2(v STRING)
-    returns INT64
-    LANGUAGE js AS """
-      var myHash = 0
-      for (let c of v){
-        myHash = myHash * 31 + c.charCodeAt(0)
-        if (myHash >= 4294967296){ // because in Hive hash() is computed on integers range
-          myHash = myHash % 4294967296
-        }
-      }
-      if (myHash >= 2147483648){
-        myHash = myHash - 4294967296
-      }
-      return myHash
-    """;
-    '''
-
-    def get_type(self):
-        return "bigQuery"
-
-    def _create_connection(self):
-        return bigquery.Client()
-
-    def get_ddl_columns(self):
-        if len(self._ddl_columns) > 0:
-            return self._ddl_columns
-        else:
-            raise AttributeError("DDL for this BigQuery table has not been given yet")  # need to be implemented one day
-
-    def get_groupby_column(self):
-        if self._group_by_column is not None:
-            return self._group_by_column
-        raise AttributeError("Not implemented yet for BigQuery since we have to receive the result from Hive")
-
-    def create_sql_groupby_count(self):
-        where_condition = ""
-        if self.where_condition is not None:
-            where_condition = "WHERE " + self.where_condition
-        query = self.hash2_js_udf + "SELECT MOD( hash2( cast(%s as STRING)), %i) as gb, count(*) as count FROM %s %s " \
-                                    "GROUP BY gb ORDER BY gb" \
-                                    % (self.get_groupby_column(), self.tc.number_of_group_by, self.full_name,
-                                       where_condition)
-        logging.debug("BigQuery query is: %s", query)
-        return query
-
-    def create_sql_show_bucket_columns(self, extra_columns_str, buckets_values):
-        where_condition = ""
-        if self.where_condition is not None:
-            where_condition = self.where_condition + " AND"
-        gb_column = self.get_groupby_column()
-        bq_query = self.hash2_js_udf + "SELECT MOD( hash2( cast(%s as STRING)), %i) as bucket, %s as gb, %s FROM %s " \
-                                       "WHERE %s MOD( hash2( cast(%s as STRING)), %i) IN (%s)" \
-                                       % (gb_column, self.tc.number_of_group_by, gb_column, extra_columns_str,
-                                          self.full_name, where_condition, gb_column, self.tc.number_of_group_by,
-                                          buckets_values)
-        logging.debug("BQ query to show the buckets and the extra columns is: %s", bq_query)
-
-        return bq_query
-
-    def create_sql_intermediate_checksums(self):
-        column_blocks = self.get_column_blocks(self.get_ddl_columns())
-        number_of_blocks = len(column_blocks)
-        logging.debug("%i column_blocks (with a size of %i columns) have been considered: %s", number_of_blocks,
-                      self.tc.block_size, str(column_blocks))
-
-        # Generate the concatenations for the column_blocks
-        bq_basic_shas = ""
-        for idx, block in enumerate(column_blocks):
-            bq_basic_shas += "TO_BASE64( sha1( concat( "
-            for col in block:
-                name = col["name"]
-                bq_value_name = name
-                if col["type"] == 'decimal':  # removing trailing & unnecessary 'zero decimal' (*.0)
-                    bq_value_name = 'regexp_replace( %s, "\\.0$", "")' % name
-                elif not col["type"] == 'string':
-                    bq_value_name = "cast( %s as STRING)" % name
-                bq_basic_shas += "CASE WHEN %s IS NULL THEN 'n_%s' ELSE %s END, '|'," % (name, name[:2], bq_value_name)
-            bq_basic_shas = bq_basic_shas[:-6] + "))) as block_%i,\n" % idx
-        bq_basic_shas = bq_basic_shas[:-2]
-
-        where_condition = ""
-        if self.where_condition is not None:
-            where_condition = "WHERE " + self.where_condition
-
-        bq_query = self.hash2_js_udf + "WITH blocks AS (\nSELECT MOD( hash2( cast(%s as STRING)), %i) as gb,\n%s\n" \
-                                       "FROM %s %s\n),\n" \
-                                       % (self.get_groupby_column(), self.tc.number_of_group_by, bq_basic_shas,
-                                          self.full_name, where_condition)  # 1st CTE with the basic block shas
-        list_blocks = ", ".join(["block_%i" % i for i in range(number_of_blocks)])
-        bq_query += "full_lines AS(\nSELECT gb, TO_BASE64( sha1( concat( %s))) as row_sha, %s FROM blocks\n)\n" \
-                    % (list_blocks, list_blocks)  # 2nd CTE to get all the info of a row
-        bq_list_shas = ", ".join(["TO_BASE64( sha1( STRING_AGG( block_%i, '|' ORDER BY block_%i))) as block_%i_gb "
-                                  % (i, i, i) for i in range(number_of_blocks)])
-        bq_query += "SELECT gb, TO_BASE64( sha1( STRING_AGG( row_sha, '|' ORDER BY row_sha))) as row_sha_gb, %s FROM " \
-                    "full_lines GROUP BY gb" % bq_list_shas  # final query where all the shas are grouped by row-blocks
-        logging.debug("##### Final BigQuery query is:\n%s\n", bq_query)
-
-        return bq_query
-
-    def delete_temporary_table(self, table_name):
-        pass  # The temporary (cached) tables in BigQuery are deleted after 24 hours
-
-    def query(self, query):
-        """Execute the received query in BigQuery and return an iterate Result object
-
-        :type query: str
-        :param query: query to execute in BigQuery
-
-        :rtype: list of rows
-        :returns: the QueryResults for this query
-        """
-        logging.debug("Launching BigQuery query")
-        q = self.connection.run_sync_query(query)
-        q.timeout_ms = 600000  # 10 minute to execute the query in BQ should be more than enough. 1 minute was too short
-        # TODO use maxResults https://cloud.google.com/bigquery/docs/reference/rest/v2/jobs/query? :
-        q.use_legacy_sql = False
-        q.run()
-        logging.debug("Fetching BigQuery results")
-        return q.fetch_data()
-
-    def query_ctas_bq(self, query):
-        """Execute the received query in BigQuery and return the name of the cache results table
-
-        This is the equivalent of a "Create Table As a Select" in Hive. The advantage is that BigQuery only keeps that
-        table during 24 hours (we don't have to delete it just like in the case of Hive), and we're not charged for the
-        space used.
-
-        :type query: str
-        :param query: query to execute in BigQuery
-
-        :rtype: str
-        :returns: the full name of the cache table (dataset.table) that stores those results
-
-        :raises: IOError if the query has some execution errors
-        """
-        logging.debug("Launching BigQuery CTAS query")
-        job_name = "job_hive_compared_bq_%f" % time.time()  # Job ID must be unique
-        job = self.connection.run_async_query(job_name.replace('.', '_'),
-                                              query)  # replace(): Job IDs must be alphanumeric
-        job.use_legacy_sql = False
-        job.begin()
-        time.sleep(3)  # 3 second is the minimum latency we get in BQ in general. So no need to try fetching before
-        retry_count = 300  # 10 minute (should be enough)
-        while retry_count > 0 and job.state != 'DONE':
-            retry_count -= 1
-            time.sleep(2)
-            job.reload()
-        logging.debug("BigQuery CTAS query finished")
-
-        if job.errors is not None:
-            raise IOError("There was a problem in executing the query in BigQuery: %s" % str(job.errors))
-
-        cache_table = job.destination.dataset_name + '.' + job.destination.name
-        print "The cache table of the final comparison query in BigQuery is: " + cache_table  # tmp table is
-        # automatically deleted after 1 day. No need to tell the user that they have to delete it
-
-        return cache_table
-
-    def launch_query_dict_result(self, query, result_dic, all_columns_from_2=False):
-        for row in self.query(query):
-            if not all_columns_from_2:
-                result_dic[row[0]] = row[1]
-            else:
-                result_dic[row[0]] = row[2:]
-        logging.debug("All %i BigQuery rows fetched", len(result_dic))
-
-    def launch_query_csv_compare_result(self, query, rows):
-        for row in self.query(query):
-            line = "^ " + " | ".join([str(col) for col in row]) + " $"
-            rows.append(line)
-        logging.debug("All %i BigQuery rows fetched", len(rows))
-
-    def launch_query_with_intermediate_table(self, query, result):
-        try:
-            result["names_sha_tables"][self.get_id_string()] = self.query_ctas_bq(query)
-            projection_gb_row_sha = "SELECT gb, row_sha_gb FROM %s" % result["names_sha_tables"][self.get_id_string()]
-            self.launch_query_dict_result(projection_gb_row_sha, result["sha_dictionaries"][self.get_id_string()])
-        except:
-            result["error"] = sys.exc_info()[1]
-            raise
 
 
 class TableComparator(object):
@@ -819,9 +361,6 @@ class TableComparator(object):
         # 201 * 40000 * 29 / 1024 /1024 = 222 MB, which should fit into the Heap of a task process
         self.block_size = 5  # 5 columns means that when we want to debug we have enough context. But it small enough to
         #  avoid being charged too much by Google when querying on it
-
-        reload(sys)
-        sys.setdefaultencoding('utf-8')
 
     def set_tsrc(self, table):
         """Set the source table to be compared
@@ -942,8 +481,8 @@ class TableComparator(object):
         :returns: True if we haven't found differences yet and further analysis is needed
         """
         if len(summary_differences) == 0:
-            print "No differences where found when doing a Count on the tables %s and %s and grouping by on the " \
-                  "column %s" % (self.tsrc.full_name, self.tdst.full_name, self.tsrc.get_groupby_column())
+            print("No differences where found when doing a Count on the tables %s and %s and grouping by on the "
+                  "column %s" % (self.tsrc.full_name, self.tdst.full_name, self.tsrc.get_groupby_column()))
             return True  # means that we should continue executing the script
 
         # We want to return at most 6 blocks of lines corresponding to different group by values. For the sake of
@@ -1127,6 +666,7 @@ class TableComparator(object):
         # We want to find the column blocks that present most of the differences, and the bucket_rows associated to it
         blocks_most_differences = Counter()
         column_blocks = self.tsrc.get_column_blocks(self.tsrc.get_ddl_columns())
+        # noinspection PyUnusedLocal
         map_colblocks_bucketrows = [[] for x in range(len(column_blocks))]
         for bucket_row, dst_blocks in dst_sha_lines.iteritems():
             src_blocks = src_sha_lines[bucket_row]
@@ -1244,8 +784,8 @@ class TableComparator(object):
         self.synchronise_tables()
         sha_differences, temporary_tables = self.compare_shas()
         if len(sha_differences) == 0:
-            print "Sha queries were done and no differences where found: the tables %s and %s are equal!" \
-                  % (self.tsrc.get_id_string(), self.tdst.get_id_string())
+            print("Sha queries were done and no differences where found: the tables %s and %s are equal!"
+                  % (self.tsrc.get_id_string(), self.tdst.get_id_string()))
             sys.exit(0)
         queries = self.get_sql_final_differences(sha_differences, temporary_tables)
         self.show_results_final_differences(queries[0], queries[1], queries[2])
@@ -1344,9 +884,9 @@ def main():
     # Create the TableComparator that contains the definition of the 2 tables we want to compare
     tc = TableComparator()
     tc.set_max_percent_most_frequent_value_in_column(args.max_gb_percent)
-    source_table = create_table_from_args(args.source, args.source_options, args.source_where, args,tc)
+    source_table = create_table_from_args(args.source, args.source_options, args.source_where, args, tc)
     destination_table = create_table_from_args(args.destination, args.destination_options, args.destination_where,
-                                               args,tc)
+                                               args, tc)
     if args.skew_threshold is not None:
         tc.set_skew_threshold(args.skew_threshold)
     tc.set_tsrc(source_table)
