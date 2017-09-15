@@ -89,6 +89,48 @@ echo 'source /home/sluangsay/bin/googlesdk/google-cloud-sdk/completion.bash.inc'
 ```
 Open a new bash session to activate those changes
 
+### Usage
+
+#### Get Help
+
+To see all the quick options of hive_compared_bq.py, just execute it without any arguments:
+```bash
+python hive_compared_bq.py
+```
+
+When calling the help, you get more detailled on the different options and also some examples:
+```bash
+python hive_compared_bq.py --help
+```
+
+#### Basic execution
+
+You must indicate the 2 tables to compare as arguments (the first table will be considered as the "source" table, and the second one as the "destination" table).
+
+Each table must have the following format: <type>/<database>.<table>
+where:
+* "type" is the technology of your database (currently, only 'hive' and 'bq' (BigQuery) are supported)
+* "database" is the name of your database (also called "dataset" in BigQuery)
+* "table" is of course the name of your table
+
+About the location of those databases:
+* In the case of BigQuery, the default Google Cloud project configured in your environment is selected
+* In the case of Hive, you must specify the hostname of the HiveServer2, using the 'hs2' option.
+
+Another note for Hive: you need to pass the HDFS direction of the jar of the required UDF (see installation of Hive above), using the 'jar' option.
+
+To clarify all the above, let's consider that we want to compare the following 2 tables:
+* A Hive table called "hive_compared_bq_table", inside the database "sluangsay". With those parameters, the argument to give is: "hive/sluangsay.hive_compared_bq_table". Let's suppose also that the hostname of HiveServer2 is 'master-003.bol.net', and that we installed the required Jar in the HDFS path 'hdfs://hdp/user/sluangsay/lib/sha1.jar'. Then, since this table is the first one on our command line, it is the source table and we need to define the option: -s "{'jar': 'hdfs://hdp/user/sluangsay/lib/sha1.jar'
+* A BigQuery table also alled "hive_compared_bq_table", inside the dataset "bidwh2".
+
+To compare above 2 tables, you need to execute:
+```bash
+python hive_compared_bq.py -s "{'jar': 'hdfs://hdp/user/sluangsay/lib/sha1.jar', 'hs2': 'master-003.bol.net'}" hive/sluangsay.hive_compared_bq_table bq/bidwh2.hive_compared_bq_table
+```
+
+# TODO: explain results (OK, count, sha pb)
+
+# TODO: describe advanced execution
 
 # TODO: explain the installation of Jar + give source code
 
