@@ -4,40 +4,41 @@ hive_compared_bq is a Python program that compares 2 (SQL like) tables, and grap
 
 Currently, there is no solution available on the internet that allows to compare the full content of some tables in a scalable way.
 
-hive_compared_bq tackes this problem by:
-
+hive_compared_bq tackles this problem by:
 * Not moving the data, avoiding long data transfer typically needed for a "Join compared" approach. Instead, only the aggregated data is moved.
-
 * Working on the full datasets and all the columns, so that we are 100% sure that the 2 tables are the same
-
 * Leveraging the tools (currently: Hive, BigQuery) to be as scalable as possible
-
 * Showing the developer in a graphical way the differences found, so that the developer can easily understands its mistakes and fix them
 
-### Features
+# Table of contents
+  * [Features](#features)
+  * [Installation](#installation)
+    + [Note Python version 2.6](#note-python-version-26)
+    + [Installing Python 2.7](#installing-python-27)
+    + [For Hive:](#for-hive-)
+    + [For Big Query:    (steps extracted from https://cloud.google.com/bigquery/docs/reference/libraries#client-libraries-install-python)](#for-big-query------steps-extracted-from-https---cloudgooglecom-bigquery-docs-reference-libraries-client-libraries-install-python-)
+  * [Usage](#usage)
+    + [Get Help](#get-help)
+    + [Basic execution](#basic-execution)
+
+## Features
 
 * Engine supported: Hive, BigQuery. (in theory, it is easy to extend it to other SQL backends such as Spanner, CloudSQL, Oracle... Help is welcomed :) ! )
-
 * Possibility to only select specific columns or to remove some of them (useful if the schema between the tables is not exactly the same, or if we know that some columns are different and we don't want them to "pollute" the results)
-
 * Possibility to just do a quick check (counting the rows in an advanced way) instead of complete checksum verification
-
 * Detection of skew
 
 
-### TODO explain a bit algorithm + show images of results + explain how to use it
+# TODO explain a bit algorithm + show images of results + explain how to use it
 
-### Installation
+## Installation
 
 Make sure the following software is available:
-
 * Python = 2.7 or 2.6 (see restrictions for 2.6)
-
 * pyhs2 (just for Hive)
-
 * google.cloud.bigquery (just for BigQuery)
 
-#### Note Python version 2.6
+### Note Python version 2.6
 BigQuery is not supported by this version of Python (Google Cloud SDK only supports Python 2.7)
 
 It is needed to install some backports for Python's collection. For instance, for a Redhat server it would be:
@@ -45,7 +46,7 @@ It is needed to install some backports for Python's collection. For instance, fo
 yum install python-backport_collections.noarch
 ```
 
-#### Installing Python 2.7
+### Installing Python 2.7
 On RHEL6, Python 2.6 was installed by default. And the RPM version in EPEL for Python2.7 had no RPM available, so I compiled it this way:
 ```bash
 su -c "yum install gcc gcc-c++ zlib-devel sqlite-devel openssl-devel"
@@ -59,14 +60,14 @@ su -c "echo 'export CLOUDSDK_PYTHON=/usr/local/bin/python2.7' >> /etc/bashrc"
 export CLOUDSDK_PYTHON=/usr/local/bin/python2.7
 ```
 
-#### For Hive:
+### For Hive:
 Execute this as "root":
 ```bash
 yum install cyrus-sasl-gssapi cyrus-sasl-devel
 pip install pyhs2
 ```
 
-#### For Big Query:    (steps extracted from https://cloud.google.com/bigquery/docs/reference/libraries#client-libraries-install-python)
+### For Big Query:    (steps extracted from https://cloud.google.com/bigquery/docs/reference/libraries#client-libraries-install-python)
 To execute below commands, make sure that you already have a Google Cloud account with a BigQuery project created.
 
 ```bash
@@ -89,9 +90,9 @@ echo 'source /home/sluangsay/bin/googlesdk/google-cloud-sdk/completion.bash.inc'
 ```
 Open a new bash session to activate those changes
 
-### Usage
+## Usage
 
-#### Get Help
+### Get Help
 
 To see all the quick options of hive_compared_bq.py, just execute it without any arguments:
 ```bash
@@ -103,7 +104,7 @@ When calling the help, you get more detailled on the different options and also 
 python hive_compared_bq.py --help
 ```
 
-#### Basic execution
+### Basic execution
 
 You must indicate the 2 tables to compare as arguments (the first table will be considered as the "source" table, and the second one as the "destination" table).
 
@@ -128,7 +129,25 @@ To compare above 2 tables, you need to execute:
 python hive_compared_bq.py -s "{'jar': 'hdfs://hdp/user/sluangsay/lib/sha1.jar', 'hs2': 'master-003.bol.net'}" hive/sluangsay.hive_compared_bq_table bq/bidwh2.hive_compared_bq_table
 ```
 
-# TODO: explain results (OK, count, sha pb)
+### Explanation on results
+
+When executing above command, if the 2 tables have exactly the same data, then we would get an output similar to:
+
+```
+[INFO]  [2017-09-15 10:59:20,851]  (MainThread) Analyzing the columns ['rowkey', 'calc_timestamp', 'categorization_step', 'dts_modified', 'global_id', 'product_category', 'product_group', 'product_subgroup', 'product_subsubgroup', 'unit'] with a sample of 10000 values
+[INFO]  [2017-09-15 10:59:22,285]  (MainThread) Best column to do a GROUP BY is rowkey (apparitions of most frequent value: 1 / the 50 most frequentvalues sum up 50 apparitions)
+[INFO]  [2017-09-15 10:59:22,286]  (MainThread) Executing the 'Group By' Count queries for sluangsay.hive_compared_bq_table (hive) and bidwh2.hive_compared_bq_table (bigQuery) to do first comparison
+No differences where found when doing a Count on the tables sluangsay.hive_compared_bq_table and bidwh2.hive_compared_bq_table and grouping by on the column rowkey
+[INFO]  [2017-09-15 10:59:48,727]  (MainThread) Executing the 'shas' queries for hive_sluangsay.hive_compared_bq_table and bigQuery_bidwh2.hive_compared_bq_table to do final comparison
+Sha queries were done and no differences where found: the tables hive_sluangsay.hive_compared_bq_table and bigQuery_bidwh2.hive_compared_bq_table are equal!
+```
+
+The first 2 lines describe the first step of the algorithm (see the explanation of the algorithm later), and we see that 'rowkey' is the column that is here used to perform the "Group By" operations.
+Then, the next 2 lines show the second step: we count the number of rows for each value of 'rowkey'. In that case, those values match for the 2 tables.
+Finally, we do the extensive computation of the SHAs for all the columns and rows of the 2 tables. At the end, the script tells us that our 2 tables are identical.
+We can also check the returns value of the script: it is 0, which means no differences.
+
+# TODO: explain results (count, sha pb)
 
 # TODO: describe advanced execution
 
