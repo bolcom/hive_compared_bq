@@ -114,7 +114,7 @@ class _Table(ABC):
             if 'hs2' not in hash_options:
                 raise ValueError("hs2 option (Hive Server2 hostname) must be defined for Hive tables")
 
-            from hive import THive  # TODO check best practice
+            from hive import THive
             return THive(database, table, table_comparator, hash_options['hs2'], hash_options.get('jar'))
         else:
             raise ValueError("The database type %s is not implemented" % typedb)
@@ -361,6 +361,8 @@ class TableComparator(object):
         # 201 * 40000 * 29 / 1024 /1024 = 222 MB, which should fit into the Heap of a task process
         self.block_size = 5  # 5 columns means that when we want to debug we have enough context. But it small enough to
         #  avoid being charged too much by Google when querying on it
+        reload(sys)
+        sys.setdefaultencoding('utf-8')
 
     def set_tsrc(self, table):
         """Set the source table to be compared
@@ -570,9 +572,10 @@ class TableComparator(object):
         """Runs the final queries on Hive and BigQuery to check if the checksum match and return the list of differences
 
         :rtype: tuple
-        :returns: ``(list_differences, names_sha_tables)``, where ``list_differences`` is the list of Group By values
-                    which presents different row checksums; ``names_sha_tables`` is a dictionary that contains the names
-                    of the "temporary" result tables
+        :returns: ``(list_differences, names_sha_tables, tables_to_clean)``, where ``list_differences`` is the list of
+                    Group By values which presents different row checksums; ``names_sha_tables`` is a dictionary that
+                    contains the names of the "temporary" result tables; ``tables_to_clean`` is a dictionary of the
+                    temporary tables we will want to remove at the end of the process
         """
         logging.info("Executing the 'shas' queries for %s and %s to do final comparison",
                      self.tsrc.get_id_string(), self.tdst.get_id_string())
@@ -622,7 +625,7 @@ class TableComparator(object):
         if len(list_differences) != 0:
             logging.info("We found %i differences in sha verification", len(list_differences))
             logging.debug("Differences in sha are: %s", list_differences[:300])
-        return list_differences, result["names_sha_tables"]
+        return list_differences, result["names_sha_tables"], result["cleaning"]
 
     def get_sql_final_differences(self, differences, temp_tables):
         """Return the queries to get the real data for the differences found in the last compare_shas() step
@@ -779,16 +782,28 @@ class TableComparator(object):
         diff, big_small = self.compare_groupby_count()
         return self.show_results_count(diff, big_small)
 
+    @staticmethod
+    def clean_step_sha(tables_to_clean):
+        """Delete temporary table if needed
+
+        :type tables_to_clean: dict
+        :param tables_to_clean: contains the name of the tables that need to be deleted, and the table object
+        """
+        for table_name, table_object in tables_to_clean:
+            table_object.delete_temporary_table(table_name)
+
     def perform_step_sha(self):
         """Execute the Sha comparison of the 2 tables"""
         self.synchronise_tables()
-        sha_differences, temporary_tables = self.compare_shas()
+        sha_differences, temporary_tables, tables_to_clean = self.compare_shas()
         if len(sha_differences) == 0:
             print("Sha queries were done and no differences where found: the tables %s and %s are equal!"
                   % (self.tsrc.get_id_string(), self.tdst.get_id_string()))
+            TableComparator.clean_step_sha(tables_to_clean)
             sys.exit(0)
         queries = self.get_sql_final_differences(sha_differences, temporary_tables)
         self.show_results_final_differences(queries[0], queries[1], queries[2])
+        TableComparator.clean_step_sha(tables_to_clean)
         sys.exit(1)
 
 

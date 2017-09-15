@@ -162,8 +162,7 @@ class TBigQuery(_Table):
             raise IOError("There was a problem in executing the query in BigQuery: %s" % str(job.errors))
 
         cache_table = job.destination.dataset_name + '.' + job.destination.name
-        print("The cache table of the final comparison query in BigQuery is: " + cache_table)  # tmp table is
-        # automatically deleted after 1 day. No need to tell the user that they have to delete it
+        logging.debug("The cache table of the final comparison query in BigQuery is: " + cache_table)
 
         return cache_table
 

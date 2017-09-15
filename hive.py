@@ -208,7 +208,7 @@ class THive(_Table):
         return hive_query
 
     def delete_temporary_table(self, table_name):
-        self.query_hive("DROP TABLE " + table_name).close()
+        self.query("DROP TABLE " + table_name).close()
 
     def query(self, query):
         """Execute the received query in Hive and return the cursor which is ready to be fetched and MUST be closed after
@@ -279,12 +279,12 @@ class THive(_Table):
         cur.execute("CREATE TABLE " + tmp_table + " AS\n" + query)
         cur.close()
         result["names_sha_tables"][self.get_id_string()] = tmp_table  # we confirm this table has been created
-        result["cleaning"] = (tmp_table, self)
+        result["cleaning"].append((tmp_table, self))
 
-        print("The temporary table for Hive is %s. REMEMBER to delete it when you've finished doing the analysis!"
-              % tmp_table)
+        logging.debug("The temporary table for Hive is " + tmp_table)
 
-        if "error" in result:  # A problem happened in BQ so there is no need to pursue or have the temp table
+        if "error" in result:  # A problem happened in the other query of the other table (usually BQ, since it is
+            # faster than Hive) so there is no need to pursue or have the temp table
             return
 
         projection_hive_row_sha = "SELECT gb, row_sha_gb FROM %s" % tmp_table
