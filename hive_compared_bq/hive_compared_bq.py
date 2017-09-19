@@ -488,9 +488,9 @@ class TableComparator(object):
             return True  # means that we should continue executing the script
 
         # We want to return at most 6 blocks of lines corresponding to different group by values. For the sake of
-        # brevity, each block should not show more than 70 lines. Blocks that show rows only on 1 table should be
-        # limited to 3 (so that we can see "context" when debugging). To also give context, we will show some few other
-        # columns.
+        # brevity, each block should not show more than 70 lines. Blocks that show rows that appear in only on 1 table
+        # should be limited to 3 (so that we can see "context" when debugging). To also give context, we will show some
+        # few other columns.
         number_buckets_only_one_table = 0
         number_buckets_found = 0
         buckets_bigtable = []
@@ -534,19 +534,23 @@ class TableComparator(object):
             extra_columns = extra_columns[:-1]  # limit to 5 columns
         extra_columns_str = str(extra_columns)[1:-1].replace("'", "")
         bigtable_query = bigtable.create_sql_show_bucket_columns(extra_columns_str, str(buckets_bigtable)[1:-1])
-        smalltable_query = smalltable.create_sql_show_bucket_columns(extra_columns_str, str(buckets_smalltable)[1:-1])
 
         result = {"big_rows": [], "small_rows": []}
         t_big = threading.Thread(name='bigShowCountDifferences-' + bigtable.get_type(),
                                  target=bigtable.launch_query_csv_compare_result,
                                  args=(bigtable_query, result["big_rows"]))
-        t_small = threading.Thread(name='smallShowCountDifferences-' + smalltable.get_type(),
-                                   target=smalltable.launch_query_csv_compare_result,
-                                   args=(smalltable_query, result["small_rows"]))
         t_big.start()
-        t_small.start()
+
+        if len(buckets_smalltable) > 0:  # in case 0, then it means that the "smalltable" does not contain any of
+            # the rows that appear in the "bigtable". In such case, there is no need to launch the query
+            smalltable_query = smalltable.create_sql_show_bucket_columns(extra_columns_str,
+                                                                         str(buckets_smalltable)[1:-1])
+            t_small = threading.Thread(name='smallShowCountDifferences-' + smalltable.get_type(),
+                                       target=smalltable.launch_query_csv_compare_result,
+                                       args=(smalltable_query, result["small_rows"]))
+            t_small.start()
+            t_small.join()
         t_big.join()
-        t_small.join()
 
         sorted_file = {}
         for instance in ("big_rows", "small_rows"):
