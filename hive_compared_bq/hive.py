@@ -181,7 +181,7 @@ class THive(_Table):
                 hive_value_name = name
                 if col["type"] == 'date':
                     hive_value_name = "cast( %s as STRING)" % name
-                elif col["type"] == 'string' and name == 'allexceptbooks':  # TODO unhardcode this name value
+                elif col["type"] == 'string' and name == 'post_prop13':  # TODO unhardcode this name value
                     hive_value_name = "DecodeCP1252( %s)" % name
                 hive_basic_shas += "CASE WHEN %s IS NULL THEN 'n_%s' ELSE %s END, '|'," % (name, name[:2],
                                                                                            hive_value_name)

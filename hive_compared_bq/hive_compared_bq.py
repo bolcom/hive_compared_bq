@@ -631,26 +631,27 @@ class TableComparator(object):
             logging.debug("Differences in sha are: %s", list_differences[:300])
         return list_differences, result["names_sha_tables"], result["cleaning"]
 
-    def get_sql_final_differences(self, differences, temp_tables):
-        """Return the queries to get the real data for the differences found in the last compare_shas() step
+    def get_column_blocks_most_differences(self, differences, temp_tables):
+        """Return the information of which columns contain most differences
 
         From the compare_shas step, we know all the rowBuckets that present some differences. The goal of this
-        function is to identify which columnsBuckets have those differences, so that we can show to the developer
-        only the rows and the columns in error. We will focus on the columns that present most of the errors.
+        function is to identify which columnsBuckets have those differences.
 
         :type differences: list of str
         :param differences: the list of Group By values which present different row checksums
 
         :type temp_tables: dict
-        :param temp_tables: contains the names of the temporary tables ["hive", "bq"]
+        :param temp_tables: contains the names of the temporary tables ["src_table", "dst_table"]
 
-        :rtype: tuple of str
-        :returns: ``(hive_final_sql, bq_final_sql, list_column_to_check)``, the queries to be executed to do the final
-                    debugging, and the name of the columns that are fetched.
+        :rtype: tuple
+        :returns: ``(column_blocks_most_differences, map_colblocks_bucketrows)``, where
+                    ``column_blocks_most_differences`` is the Counter of the column blocks with most differences;
+                    ``map_colblocks_bucketrows`` is a list that "maps" a column block with the list of the hash of the
+                    bucket rows that contain a difference
 
         :raises: IOError if the query has some execution errors
         """
-        subset_differences = str(differences[:3000])[1:-1]  # let's choose quite a big number (instead of just looking
+        subset_differences = str(differences[:10000])[1:-1]  # let's choose quite a big number (instead of just looking
         # at some few (5 for instance) differences for 2 reasons: 1) by fetching more rows we will find estimate
         # better which column blocks fail often 2) we have less possibilities to face some 'permutations' problems
         logging.debug("The sha differences that we consider are: %s", str(subset_differences))
@@ -671,7 +672,7 @@ class TableComparator(object):
         t_dst.join()
 
         # We want to find the column blocks that present most of the differences, and the bucket_rows associated to it
-        blocks_most_differences = Counter()
+        column_blocks_most_differences = Counter()
         column_blocks = self.tsrc.get_column_blocks(self.tsrc.get_ddl_columns())
         # noinspection PyUnusedLocal
         map_colblocks_bucketrows = [[] for x in range(len(column_blocks))]
@@ -679,10 +680,10 @@ class TableComparator(object):
             src_blocks = src_sha_lines[bucket_row]
             for idx, sha in enumerate(dst_blocks):
                 if sha != src_blocks[idx]:
-                    blocks_most_differences[idx] += 1
+                    column_blocks_most_differences[idx] += 1
                     map_colblocks_bucketrows[idx].append(bucket_row)
         logging.debug("Block columns with most differences are: %s. Which correspond to those bucket rows: %s",
-                      blocks_most_differences, map_colblocks_bucketrows)
+                      column_blocks_most_differences, map_colblocks_bucketrows)
 
         # collisions could happen for instance with those 2 "rows" (1st column is the Group BY value, 2nd column is the
         # value of a column in the data, 3rd column is the value of another column which belongs to another 'block
@@ -694,14 +695,38 @@ class TableComparator(object):
         # bucket1   0   A
         # bucket1   1   B
         # In such case, the 'grouped sha of each column' will be always the same. But the sha-lines will be different
-        if len(blocks_most_differences) == 0:
+        if len(column_blocks_most_differences) == 0:
             raise RuntimeError("Program faced some collisions when trying to assess which blocks of columns were not"
                                "correct. Please contact the developer to ask for a fix")
-        block_most_different = blocks_most_differences.most_common(1)[0][0]
+        return column_blocks_most_differences, map_colblocks_bucketrows
+
+    def get_sql_final_differences(self, column_blocks_most_differences, map_colblocks_bucketrows, index):
+        """Return the queries to get the real data for the differences found in the last compare_shas() step
+
+        Get the definition of the [index]th column block with most differences, and generate the SQL queries that will
+        be triggered to show to the developer those differences.
+
+        :type column_blocks_most_differences: :class:`Counter`
+        :param column_blocks_most_differences: the Counter of the column blocks with most differences. The keys of this
+                Counter is the index of the column block
+
+        :type map_colblocks_bucketrows: list of list
+        :param map_colblocks_bucketrows: list that "maps" a column block (the element N in the list corresponds to the
+        column block N) with the list of the hash of the bucket rows that contain a difference.
+
+        :type index: int
+        :param index: the position of the block column we want to get
+
+        :rtype: tuple of str
+        :returns: ``(hive_final_sql, bq_final_sql, list_column_to_check)``, the queries to be executed to do the final
+                    debugging, and the name of the columns that are fetched.
+        """
+        column_block_most_different = column_blocks_most_differences.most_common(index)[index - 1][0]
+        column_blocks = self.tsrc.get_column_blocks(self.tsrc.get_ddl_columns())
         # buckets otherwise we might want to take a second block
-        list_column_to_check = " ,".join([x["name"] for x in column_blocks[block_most_different]])
+        list_column_to_check = " ,".join([x["name"] for x in column_blocks[column_block_most_different]])
         # let's display just 10 buckets in error max
-        list_hashs = " ,".join(map(str, map_colblocks_bucketrows[block_most_different][:10]))
+        list_hashs = " ,".join(map(str, map_colblocks_bucketrows[column_block_most_different][:10]))
 
         src_final_sql = self.tsrc.create_sql_show_bucket_columns(list_column_to_check, list_hashs)
         dst_final_sql = self.tdst.create_sql_show_bucket_columns(list_column_to_check, list_hashs)
@@ -805,8 +830,20 @@ class TableComparator(object):
                   % (self.tsrc.get_id_string(), self.tdst.get_id_string()))
             TableComparator.clean_step_sha(tables_to_clean)
             sys.exit(0)
-        queries = self.get_sql_final_differences(sha_differences, temporary_tables)
-        self.show_results_final_differences(queries[0], queries[1], queries[2])
+
+        cb_most_diff, map_cb_bucketrows = self.get_column_blocks_most_differences(sha_differences, temporary_tables)
+
+        for idx_cb in range(1, len(cb_most_diff) + 1):
+            if idx_cb > 1:
+                answer = raw_input('Do you want to see more differences? [Y/n]: ')
+                # Yes being the default, we only exit in case of properly pushing 'n'
+                if answer == 'n':
+                    break
+
+            queries = self.get_sql_final_differences(cb_most_diff, map_cb_bucketrows, idx_cb)
+            print("Showing differences for columns " + queries[2])
+            self.show_results_final_differences(queries[0], queries[1], queries[2])
+
         TableComparator.clean_step_sha(tables_to_clean)
         sys.exit(1)
 

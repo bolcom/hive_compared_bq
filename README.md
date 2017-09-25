@@ -191,6 +191,9 @@ TODO
 
 python hive_compared_bq.py -s "{'jar': 'hdfs://hdp-b/user/sluangsay/lib/sha1.jar', 'hs2': 'shd-hdp-b-master-003.bolcom.net'}" hive/sluangsay.hive_compared_bq_table3 bq/bidwh2.hive_compared_bq_table3
 
+If there are several "column blocks" that have some differences, then the program will first show the column block that contains more "row blocks" with differences (take care: that does not mean that it is the column block that contains more differences. We could have indeed a column block with just 1 row block with differences, but that 1 row block could contain 1000s of rows with differences. On the other hand, we could imagine another column block with 2 row blocks containing differences, but each row block could contain 1 single row with differences).<br/>
+Then after, the program will ask you if you wish to see another column block with differences.
+
 ### Advanced executions
 
 #### Faster executions
