@@ -229,6 +229,8 @@ class THive(_Table):
         try:
             cur = self.connection.cursor()
             cur.execute("set mapreduce.input.fileinputformat.split.maxsize = %i" % split_maxsize)
+            cur.execute("set hive.fetch.task.conversion=minimal")  # force a MapReduce, because simple 'fetch' queries
+            # on a large table may generate some timeout otherwise
             cur.execute(query)
         except:
             raise IOError("There was a problem in executing the query in Hive: %s", sys.exc_info()[1])
