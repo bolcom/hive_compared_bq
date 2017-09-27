@@ -34,7 +34,7 @@ hive_compared_bq tackles this problem by:
 
 ## Features
 
-* Engine supported: Hive, BigQuery. (in theory, it is easy to extend it to other SQL backends such as Spanner, CloudSQL, Oracle... Help is welcomed :) ! )
+* Engines supported: Hive, BigQuery (and HBase to some extent). In theory, it is easy to extend it to other SQL backends such as Spanner, CloudSQL, Oracle... Help is welcomed :) !
 * Possibility to only select specific columns or to remove some of them (useful if the schema between the tables is not exactly the same, or if we know that some columns are different and we don't want them to "pollute" the results)
 * Possibility to just do a quick check (counting the rows in an advanced way) instead of complete checksum verification
 * Detection of skew
@@ -78,7 +78,10 @@ pip install pyhs2
 
 #### TODO: explain the installation of Jar + give source code
 
-### For Big Query:    (steps extracted from https://cloud.google.com/bigquery/docs/reference/libraries#client-libraries-install-python)
+### For Big Query:
+
+(steps extracted from https://cloud.google.com/bigquery/docs/reference/libraries#client-libraries-install-python)
+
 To execute below commands, make sure that you already have a Google Cloud account with a BigQuery project created.
 
 ```bash
@@ -126,8 +129,9 @@ where:
 * "table" is of course the name of your table
 
 About the location of those databases:
-* In the case of BigQuery, the default Google Cloud project configured in your environment is selected
-* In the case of Hive, you must specify the hostname of the HiveServer2, using the 'hs2' option.
+* In the case of BigQuery, the default Google Cloud project configured in your environment is selected.<br/>
+If you want to specify another project, you must indicate it with the 'project' parameter with the "-s" or "-d" options.
+* In the case of Hive, you must specify the hostname of the HiveServer2, using the 'hs2' parameter with the "-s" or "-d" options.
 
 Another note for Hive: you need to pass the HDFS direction of the jar of the required UDF (see installation of Hive above), using the 'jar' option.
 
@@ -228,7 +232,20 @@ In such case you have to use the '--source-where' and '--destination-where' to s
 TODO
 
 #### Schema not matching
-TODO
+
+To do the comparison, the program needs to first discover the schemas of the tables. What is actually done is fetching the schema of the "source table", and assuming that the "destination table" has the same schema.
+
+If the schemas between the 2 tables don't match, then by default it is not possible to compare them.<br/>
+This can easily happen for instance in partitioned tables with BigQuery, where the "column partition" is called "_PARTITIONTIME" and may not match the name of this table in Hive.<br/>
+To overcome this, there are 2 possibilities:
+* creating some views (in Hive or BigQuery) to rename or remove some columns. Take care not to make this view too complex otherwise that could lower the validity of the comparison.
+* limit the column you want to compare, using the options "--column-range", "--columns", "--ignore-columns". The problem of this approach is that you cannot rename columns.
+
+#### HBase tables
+
+It is possible to do also the comparison with some HBase tables.<br/>
+To do so, you need to create a Hive table with a HBase backend (see documentation: https://cwiki.apache.org/confluence/display/Hive/HBaseIntegration ).<br/>
+Be aware that Hive on top HBase has some limitations, so you won't be able to check all the data in your HBase tables (for instance: you cannot see the timestamps, or older versions of a cell, and all the columns must be properly defined in the Hive schema).
 
 #### Problems in the selection of the GroupBy column
 

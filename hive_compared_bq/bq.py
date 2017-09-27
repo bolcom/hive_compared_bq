@@ -26,11 +26,19 @@ class TBigQuery(_Table):
     """;
     '''
 
+    def __init__(self, database, table, parent, project):
+        self.project = project  # the Google Cloud project where this dataset/table belongs.If Null, then the default
+        #  environment where this script is executed is used.
+        _Table.__init__(self, database, table, parent)
+
     def get_type(self):
         return "bigQuery"
 
     def _create_connection(self):
-        return bigquery.Client()
+        if self.project is None:
+            return bigquery.Client()
+        else:
+            return bigquery.Client(project=self.project)
 
     def get_ddl_columns(self):
         if len(self._ddl_columns) > 0:

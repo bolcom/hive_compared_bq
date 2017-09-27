@@ -66,6 +66,50 @@ class _Table(ABC):
         self._group_by_column = None  # the column that is used to "bucket" the rows
 
     @staticmethod
+    def check_stdin_options(typedb, stdin_options, allowed_options, compulsory_options):
+        """Validate the options entered, given those allowed and those compulsory
+
+        :type typedb: str
+        :param typedb: the type of the database ({hive,bq})
+
+        :type stdin_options: str
+        :param stdin_options: the options entered on command line for this table, given in a Python dictionary format
+
+        :type allowed_options: list of str
+        :param allowed_options: the list of options that can be used for this table
+
+        :type compulsory_options: dict
+        :param compulsory_options: dictionary where the keys are the name of the compulsory options, and the value
+                is a small description of it
+
+        :rtype: dict
+        :return: a dictionary of the options entered by the user
+
+        :raises: ValueError if the option entered is invalid
+        """
+        hash_options = {}
+        if stdin_options is not None:
+            try:
+                hash_options = ast.literal_eval(stdin_options)
+            except:
+                raise ValueError("The option must be in a Python dictionary format (just like: {'jar': "
+                                 "'hdfs://hdp/user/sluangsay/lib/sha1.jar', 'hs2': 'master-003.bol.net'}\nThe value "
+                                 "received was: %s" % stdin_options)
+
+            for key in hash_options:
+                if key not in allowed_options:
+                    raise ValueError("The following option for %s is not supported: %s\nThe only supported options"
+                                     " are: %s" % (typedb, key, allowed_options))
+
+        # Needs to be checked even if the user has given no option
+        for key in compulsory_options:
+            if key not in hash_options:
+                raise ValueError("%s option (%s) must be defined for %s tables" % (key, compulsory_options[key],
+                                 typedb))
+
+        return hash_options
+
+    @staticmethod
     def create_table_from_string(argument, options, table_comparator):
         """Parse an argument (usually received on the command line) and return the corresponding Table object
 
@@ -93,27 +137,12 @@ class _Table(ABC):
         database = match.group(2)
         table = match.group(3)
 
-        hash_options = {}
-        if options is not None:
-            try:
-                hash_options = ast.literal_eval(options)
-            except:
-                raise ValueError("The option must be in a Python dictionary format (just like: {'jar': "
-                                 "'hdfs://hdp/user/sluangsay/lib/sha1.jar', 'hs2': 'master-003.bol.net'}\nThe value"
-                                 "received was: %s", options)
-
         if typedb == "bq":
+            hash_options = _Table.check_stdin_options(typedb, options, ["project"], {})
             from bq import TBigQuery
-            return TBigQuery(database, table, table_comparator)
+            return TBigQuery(database, table, table_comparator, hash_options.get('project'))
         elif typedb == "hive":
-            allowed_options = ["jar", "hs2"]
-            for key in hash_options:
-                if key not in allowed_options:
-                    raise ValueError("The following option for Hive is not supported: %s\nThe only supported options"
-                                     "are: %s", key, allowed_options)
-            if 'hs2' not in hash_options:
-                raise ValueError("hs2 option (Hive Server2 hostname) must be defined for Hive tables")
-
+            hash_options = _Table.check_stdin_options(typedb, options, ["jar", "hs2"], {'hs2': 'Hive Server2 hostname'})
             from hive import THive
             return THive(database, table, table_comparator, hash_options['hs2'], hash_options.get('jar'))
         else:
@@ -864,7 +893,8 @@ def parse_arguments():
 
     parser.add_argument("-s", "--source-options", help="options for the source table\nFor Hive that could be: {'jar': "
                                                        "'hdfs://hdp/user/sluangsay/lib/sha1.jar', 'hs2': "
-                                                       "'master-003.bol.net'}")
+                                                       "'master-003.bol.net'}\nExample for BigQuery: {'project': "
+                                                       "'myGoogleCloudProject'}")
     parser.add_argument("-d", "--destination-options", help="options for the destination table")
 
     parser.add_argument("--source-where", help="the WHERE condition we want to apply for the source table\n"
