@@ -102,7 +102,7 @@ This last command tells you to source 2 files in every session. So include them 
 echo 'source /home/sluangsay/bin/googlesdk/google-cloud-sdk/path.bash.inc' >> ~/.bash_profile
 echo 'source /home/sluangsay/bin/googlesdk/google-cloud-sdk/completion.bash.inc' >> ~/.bash_profile
 ```
-Open a new bash session to activate those changes
+Open a new bash session to activate those changes.
 
 ## Usage
 
@@ -136,7 +136,9 @@ If you want to specify another project, you must indicate it with the 'project' 
 Another note for Hive: you need to pass the HDFS direction of the jar of the required UDF (see installation of Hive above), using the 'jar' option.
 
 To clarify all the above, let's consider that we want to compare the following 2 tables:
-* A Hive table called "hive_compared_bq_table", inside the database "sluangsay". With those parameters, the argument to give is: "hive/sluangsay.hive_compared_bq_table". Let's suppose also that the hostname of HiveServer2 is 'master-003.bol.net', and that we installed the required Jar in the HDFS path 'hdfs://hdp/user/sluangsay/lib/sha1.jar'. Then, since this table is the first one on our command line, it is the source table and we need to define the option: -s "{'jar': 'hdfs://hdp/user/sluangsay/lib/sha1.jar'
+* A Hive table called "hive_compared_bq_table", inside the database "sluangsay".<br/>
+With those parameters, the argument to give is: "hive/sluangsay.hive_compared_bq_table".<br/>
+Let's suppose also that the hostname of HiveServer2 is 'master-003.bol.net', and that we installed the required Jar in the HDFS path 'hdfs://hdp/user/sluangsay/lib/sha1.jar'. Then, since this table is the first one on our command line, it is the source table and we need to define the option: -s "{'jar': 'hdfs://hdp/user/sluangsay/lib/sha1.jar'
 * A BigQuery table also alled "hive_compared_bq_table", inside the dataset "bidwh2".
 
 To compare above 2 tables, you need to execute:
@@ -182,18 +184,34 @@ Some of the differences are also shown in a HTML file that is automatically open
 
 ![alt text](docs/images/differences_count.png?raw=true "Differences in GroupBy numbers")
 
-This shows a table, with the rows of 1 table on the right side, and the ones of the other table on the right side.
-The names of the table appear at the top of the table.
-There we can also see the names of the columns that are shown.
-For performance reason and also sake of brevity, only some 7 columns are shown.
-The first 2 columns are "special columns": the GroupBy column (2nd column), and just before its SHA1 value (1st column).
+This shows a table, with the rows of 1 table on the right side, and the ones of the other table on the right side.<br/>
+The names of the table appear at the top of the table.<br/>
+There we can also see the names of the columns that are shown.<br/>
+For performance reason and also sake of brevity, only some 7 columns are shown.<br/>
+The first 2 columns are "special columns": the GroupBy column (2nd column), and just before its SHA1 value (1st column).<br/>
 In this example, we can see that only rows on the left side appear: this is because the table on the right does not contain rows that contain the rowkeys 21411000029, 65900009 and 6560009.
 
 #### Case of differences inside the rows
 
-TODO
+If the numbers of rows match it is still possible to observe some differences in the last (SHA1) step. In which case, we would get some message similar to:
 
-python hive_compared_bq.py -s "{'jar': 'hdfs://hdp-b/user/sluangsay/lib/sha1.jar', 'hs2': 'shd-hdp-b-master-003.bolcom.net'}" hive/sluangsay.hive_compared_bq_table3 bq/bidwh2.hive_compared_bq_table3
+```
+[INFO]	[2017-09-28 05:53:55,890]  (MainThread) Analyzing the columns ['rowkey', 'calc_timestamp', 'categorization_step', 'dts_modified', 'global_id', 'product_category', 'product_group', 'product_subgroup', 'product_subsubgroup', 'unit'] with a sample of 10000 values
+[INFO]	[2017-09-28 05:53:56,897]  (MainThread) Best column to do a GROUP BY is rowkey (apparitions of most frequent value: 1 / the 50 most frequentvalues sum up 50 apparitions)
+[INFO]	[2017-09-28 05:53:56,897]  (MainThread) Executing the 'shas' queries for hive_sluangsay.hive_compared_bq_table3 and bigQuery_bidwh2.hive_compared_bq_table3 to do final comparison
+[INFO]	[2017-09-28 05:54:26,961]  (MainThread) We found 2 differences in sha verification
+Showing differences for columns product_category ,product_group ,product_subgroup ,product_subsubgroup ,unit
+```
+
+The return value of the script would be 1.
+
+Some of the differences are also shown in a HTML file that is automatically opened in your browser:
+
+TODO link
+
+We can see some similar information as the one exposed for differences in the "Count validation" (see above).<br/>
+The 7 columns are: first the 2 "special columns", then the 5 columns of a "column block" (see "algorithm" section for explanations) which contains some differences. That means that at least 1 of those 5 columns has at least 1 value different.<br/>
+In our example, we can see that the 2 rows have some differences in the column "product_subgroup". Those differences are highlighted in yellow.
 
 If there are several "column blocks" that have some differences, then the program will first show the column block that contains more "row blocks" with differences (take care: that does not mean that it is the column block that contains more differences. We could have indeed a column block with just 1 row block with differences, but that 1 row block could contain 1000s of rows with differences. On the other hand, we could imagine another column block with 2 row blocks containing differences, but each row block could contain 1 single row with differences).<br/>
 Then after, the program will ask you if you wish to see another column block with differences.
@@ -229,7 +247,25 @@ In such case, you can use the '--column-range', '--columns' or '--ignore-columns
 In such case you have to use the '--source-where' and '--destination-where' to specify a Where condition that tells which partition you want to consider.
 
 #### Skewing problem
-TODO
+
+The program does several queries with some GroupBy operations. As for every GroupBy operation with huge volume of data, skew can be a performance killer, or can even make the query failing because of lack of resources.
+
+The "count comparison" step (see description of the algorithm to know more about the steps) does not do any complex computation, so skew is annoying but should not be a very big issue.<br/>
+However, the "SHA1 comparison" step launches some heavy queries, and skew can mean a huge difference.<br/>
+In our algorithm, skew is determined by the skew in the distribution of the GroupBy column. This is why the selection of this column in the first step of the program is crucial, and that it can mean a huge different if you specify yourself a column that has a good distribution.<br/>
+For the above reasons, a skew detection is done during the "count comparison" step. In case a "groupBy value" appears in more than 40 000 rows (you may change this default value with the option '--skew-threshold'), then this groupBy value will be registered and a warning message like this will appear:
+```
+Some important skew (threshold: %i) was detected in the Group By column x. The top values are:
+```
+Following that message, the list of all the top 10 skewed values (and their number of apparitions) pops up so that a developer can know that he should avoid selecting that GroupBy column the next time he runs the program.
+And it also gives the possibility to wonder if it is normal for this dataset to contain such skewed values.
+
+If the "count comparison" step has not encountered any error, but some skew has been discovered, then the program will also stop, with the following message:
+```
+No difference in Group By count was detected but we saw some important skew that could make the next step (comparison of the shas) very slow or failing. So better stopping now. You should consider choosing another Group By column with the '--group-by-column' option
+```
+As explained before, stopping at this stage is a protection to avoid launching some heavy/costly queries that have some high probability to fail.<br/>
+Should you face this situation, then your best option is to specify a GroupBy column with a better distribution with the '--group-by-column' option. Another possibility is to raise the threshold with '--skew-threshold': in such case that means that you accept and understand the risk of launching the SHA1 computations with these skewed values.
 
 #### Schema not matching
 
