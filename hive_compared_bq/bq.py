@@ -91,6 +91,8 @@ class TBigQuery(_Table):
                 bq_value_name = name
                 if col["type"] == 'decimal':  # removing trailing & unnecessary 'zero decimal' (*.0)
                     bq_value_name = 'regexp_replace( %s, "\\.0$", "")' % name
+                elif col["type"] == 'float' or col["type"] == 'double':
+                    bq_value_name = "cast( cast( FLOOR( %s * 10000) as INT64) as STRING)" % name
                 elif not col["type"] == 'string':
                     bq_value_name = "cast( %s as STRING)" % name
                 bq_basic_shas += "CASE WHEN %s IS NULL THEN 'n_%s' ELSE %s END, '|'," % (name, name[:2], bq_value_name)

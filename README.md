@@ -15,9 +15,9 @@ hive_compared_bq tackles this problem by:
   * [Installation](#installation)
     + [Note Python version 2.6](#note-python-version-26)
     + [Installing Python 2.7](#installing-python-27)
-    + [For Hive:](#for-hive-)
+    + [For Hive](#for-hive)
       - [TODO: explain the installation of Jar + give source code](#todo--explain-the-installation-of-jar---give-source-code)
-    + [For Big Query:    (steps extracted from https://cloud.google.com/bigquery/docs/reference/libraries#client-libraries-install-python)](#for-big-query------steps-extracted-from-https---cloudgooglecom-bigquery-docs-reference-libraries-client-libraries-install-python-)
+    + [For Big Query](#for-big-query)
   * [Usage](#usage)
     + [Get Help](#get-help)
     + [Basic execution](#basic-execution)
@@ -29,8 +29,10 @@ hive_compared_bq tackles this problem by:
       - [Faster executions](#faster-executions)
       - [Skewing problem](#skewing-problem)
       - [Schema not matching](#schema-not-matching)
+      - [HBase tables](#hbase-tables)
       - [Problems in the selection of the GroupBy column](#problems-in-the-selection-of-the-groupby-column)
   * [Algorithm](#algorithm)
+    + [Imprecision due to "float" of "double" types](#imprecision-due-to--float--of--double--types)
 
 ## Features
 
@@ -68,7 +70,7 @@ su -c "echo 'export CLOUDSDK_PYTHON=/usr/local/bin/python2.7' >> /etc/bashrc"
 export CLOUDSDK_PYTHON=/usr/local/bin/python2.7
 ```
 
-### For Hive:
+### For Hive
 Execute this as "root":
 ```bash
 yum install cyrus-sasl-gssapi cyrus-sasl-devel
@@ -78,7 +80,7 @@ pip install pyhs2
 
 #### TODO: explain the installation of Jar + give source code
 
-### For Big Query:
+### For Big Query
 
 (steps extracted from https://cloud.google.com/bigquery/docs/reference/libraries#client-libraries-install-python)
 
@@ -368,3 +370,19 @@ During this step, a skew detection is also performed, which is a protection for 
 * Full SHA1 validation.<br/>
 This step, described earlier in this paragraph, is the only one that can guarantee that the 2 tables are identical.
 
+### Imprecision due to "float" of "double" types
+
+Those representations of a decimal number are not always exact, and small differences in their representations can be sometimes observed between Hive and BigQuery, meaning that the corresponding SHA1 values will be totally different.<br/>
+For instance, the following query in BigQuery returns '8.5400000000000009':
+```
+select  cast( cast( 8.540000000000001 as FLOAT64 ) as STRING)
+```
+And in Hive we would get '8.540000000000001'.
+
+To overcome those problems, it was decided to:
+* multiply any float or double number by 10000 (most of the decimal numbers managed in Bol.com are 'price numbers' with just 2 digits, so multiplying by 10000 should give enough precision).
+* round the resulting number with floor() in order to get rid of any "decimal imprecision"
+* cast the result into an integer (otherwise the previous number may end up with a '.0' or not, depending if it is Hive or BigQuery)
+
+The above approach works in many cases but we understand that it is not a general solution (for instance, no distinction would be made between '0.0000001' and '0').<br/>
+We may thus need in the future to add other possibilities to solve those imprecision problems.
