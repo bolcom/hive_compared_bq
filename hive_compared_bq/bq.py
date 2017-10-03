@@ -12,6 +12,9 @@ class TBigQuery(_Table):
     hash2_js_udf = '''create temp function hash2(v STRING)
     returns INT64
     LANGUAGE js AS """
+      if(v === null){
+        return 0  // same behaviour as in Hive
+      }
       var myHash = 0
       for (let c of v){
         myHash = myHash * 31 + c.charCodeAt(0)
