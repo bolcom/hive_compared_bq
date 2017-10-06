@@ -1,16 +1,10 @@
 import logging
-import re
 import sys
 import time
 # noinspection PyProtectedMember
 from hive_compared_bq import _Table
 import pyhs2  # TODO switch to another module since this one is deprecated and does not support Python 3
 # see notes in : https://github.com/BradRuderman/pyhs2
-if sys.version_info[0:2] == (2, 6):
-    # noinspection PyUnresolvedReferences
-    from backport_collections import Counter
-else:
-    from collections import Counter
 
 
 class THive(_Table):
@@ -36,7 +30,7 @@ class THive(_Table):
         cur.execute("describe " + self.full_name)
         all_columns = []
         while cur.hasMoreRows:
-            row = cur.fetchone()  # TODO check if we should not do fetchall instead, or other fetch batch
+            row = cur.fetchone()
             if row is None:
                 continue
             col_name = row[0]
@@ -56,52 +50,11 @@ class THive(_Table):
                 self._ddl_partitions.append(my_dic)
         cur.close()
 
-        if self.column_range == ":":
-            if self.chosen_columns is not None:  # user has declared the columns he wants to analyze
-                leftover = list(self.chosen_columns)
-                for col in all_columns:
-                    if col['name'] in leftover:
-                        leftover.remove(col['name'])
-                        self._ddl_columns.append(col)
-                if len(leftover) > 0:
-                    sys.exit("Error: you asked to analyze the columns %s but we could not find them in the table %s"
-                             % (str(leftover), self.get_id_string()))
-            else:
-                self._ddl_columns = all_columns
-        else:  # user has requested a specific range of columns
-            match = re.match(r'(\d*):(\d*)', self.column_range)
-            if match is None:
-                raise ValueError("The column range must follow the Python style '1:9'. You gave: %s", self.column_range)
-
-            start = 0
-            if len(match.group(1)) > 0:
-                start = int(match.group(1))
-            end = len(all_columns)
-            if len(match.group(2)) > 0:
-                end = int(match.group(2))
-            self._ddl_columns = all_columns[start:end]
-            logging.debug("The range of columns has been reduced to: %s", self._ddl_columns)
-
-        if self.ignore_columns is not None:
-            all_columns = []
-            for col in self._ddl_columns:
-                if not col['name'] in self.ignore_columns:
-                    all_columns.append(col)
-            self._ddl_columns = list(all_columns)
+        self.filter_columns_from_cli(all_columns)
 
         return self._ddl_columns
 
-    def get_groupby_column(self):
-        if self._group_by_column is not None:
-            return self._group_by_column
-
-        query, selected_columns = self.get_sample_query()
-
-        #  Get a sample from the table and fill Counters to each column
-        logging.info("Analyzing the columns %s with a sample of %i values", str([x["name"] for x in selected_columns]),
-                     self.tc.sample_rows_number)
-        for col in selected_columns:
-            col["Counter"] = Counter()
+    def get_column_statistics(self, query, selected_columns):
         cur = self.connection.cursor()
         cur.execute(query)
         while cur.hasMoreRows:
@@ -111,35 +64,6 @@ class THive(_Table):
                     value_column = fetched[idx]
                     col["Counter"][value_column] += 1  # TODO what happens with NULL? (case of globalid in Omniture)
         cur.close()
-
-        #  Look at the statistics to estimate which column is the best to do a GROUP BY
-        max_frequent_number = self.tc.sample_rows_number * self.tc.max_percent_most_frequent_value_in_column // 100
-        minimum_weight = sys.maxint
-        highest_first = max_frequent_number
-        for col in selected_columns:
-            highest = col["Counter"].most_common(1)[0]
-            if highest[1] > max_frequent_number:
-                logging.debug(
-                    "Discarding column '%s' because '%s' was found in sample %i times (higher than limit of %i)",
-                    col["name"], highest[0], highest[1], max_frequent_number)
-                continue
-            # The biggest value is not too high, so let's see how big are the 50 biggest values
-            weight_of_most_frequent_values = sum([x[1] for x in col["Counter"]
-                                                 .most_common(self.tc.number_of_most_frequent_values_to_weight)])
-            logging.debug("%s: sum up of the %i most frequent apparitions: %i", col["name"],
-                          self.tc.number_of_most_frequent_values_to_weight, weight_of_most_frequent_values)
-            if weight_of_most_frequent_values < minimum_weight:
-                self._group_by_column = col["name"]
-                minimum_weight = weight_of_most_frequent_values
-                highest_first = highest[1]
-        if self._group_by_column is None:
-            sys.exit("Error: we could not find a suitable column to do a Group By. Either relax the selection condition"
-                     " with the '--max-gb-percent' option or directly select the column with '--group-by-column' ")
-        logging.info("Best column to do a GROUP BY is %s (apparitions of most frequent value: %i / the %i most frequent"
-                     "values sum up %i apparitions)", self._group_by_column, highest_first,
-                     self.tc.number_of_most_frequent_values_to_weight, minimum_weight)
-
-        return self._group_by_column
 
     def create_sql_groupby_count(self):
         where_condition = ""
@@ -224,9 +148,10 @@ class THive(_Table):
         :raises: IOError if the query has some execution errors
         """
         logging.debug("Launching Hive query")
+        #  TODO split number should be done in function of file format (ORC, Avro...) and number of columns
         #  split_maxsize = 256000000
-        # split_maxsize = 64000000
-        split_maxsize = 8000000
+        split_maxsize = 64000000
+        # split_maxsize = 8000000
         # split_maxsize = 16000000
         try:
             cur = self.connection.cursor()
@@ -243,7 +168,7 @@ class THive(_Table):
         try:
             cur = self.query(query)
             while cur.hasMoreRows:
-                row = cur.fetchone()
+                row = cur.fetchone()  # TODO check if we should not do fetchall instead, or other fetch batch
                 if row is not None:
                     if not all_columns_from_2:
                         result_dic[row[0]] = row[1]

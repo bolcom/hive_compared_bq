@@ -34,6 +34,16 @@ class TBigQuery(_Table):
         #  environment where this script is executed is used.
         _Table.__init__(self, database, table, parent)
 
+        # check that we can reach dataset and table
+        dataset = self.connection.dataset(database)
+        if not dataset.exists():
+            raise AttributeError("The dataset %s:%s does not seem to exist or is unreachable" % (project, database))
+
+        mytable = dataset.table(table)
+        if not mytable.exists():
+            raise AttributeError("The table %s:%s.%s does not seem to exist or is unreachable" %
+                                 (project, database, table))
+
     def get_type(self):
         return "bigQuery"
 
@@ -47,12 +57,31 @@ class TBigQuery(_Table):
         if len(self._ddl_columns) > 0:
             return self._ddl_columns
         else:
-            raise AttributeError("DDL for this BigQuery table has not been given yet")  # need to be implemented one day
+            dataset = self.connection.dataset(self.database)
+            table = dataset.table(self.table)
+            table.reload()
+            schema = table.schema
 
-    def get_groupby_column(self):
-        if self._group_by_column is not None:
-            return self._group_by_column
-        raise AttributeError("Not implemented yet for BigQuery since we have to receive the result from Hive")
+            all_columns = []
+            for field in schema:
+                col_name = str(field.name)
+                col_type = str(
+                    field.field_type.lower())  # force 'str' to remove unicode notation and align it to Hive format
+                # let's align the types with the ones in Hive
+                if col_type == 'integer':
+                    col_type = 'bigint'
+                my_dic = {"name": col_name, "type": col_type}
+                all_columns.append(my_dic)
+
+            self.filter_columns_from_cli(all_columns)
+
+            return self._ddl_columns
+
+    def get_column_statistics(self, query, selected_columns):
+        for row in self.query(query):
+            for idx, col in enumerate(selected_columns):
+                value_column = row[idx]
+                col["Counter"][value_column] += 1
 
     def create_sql_groupby_count(self):
         where_condition = ""

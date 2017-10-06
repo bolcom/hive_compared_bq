@@ -195,7 +195,6 @@ class _Table(ABC):
         """
         pass
 
-    @abstractmethod
     def get_groupby_column(self):
         """Return a column that seems to have a good distribution in order to do interesting GROUP BY queries with it
 
@@ -209,7 +208,116 @@ class _Table(ABC):
         :rtype: str
         :returns: the column that will be used in the Group By
         """
+        if self._group_by_column is not None:
+            return self._group_by_column
+
+        query, selected_columns = self.get_sample_query()
+
+        #  Get a sample from the table and fill Counters to each column
+        logging.info("Analyzing the columns %s with a sample of %i values", str([x["name"] for x in selected_columns]),
+                     self.tc.sample_rows_number)
+        for col in selected_columns:
+            col["Counter"] = Counter()  # col: {"name","type"} dictionary. New "counter" key is to track distribution
+
+        self.get_column_statistics(query, selected_columns)
+        self.find_best_distributed_column(selected_columns)
+
+        return self._group_by_column
+
+    @abstractmethod
+    def get_column_statistics(self, query, selected_columns):
+        """Launch the sample query and register the distribution of the selected_columns in the "Counters"
+
+        :type query: str
+        :param query: SQL query that gets a sample of rows with only the selected columns
+
+        :type selected_columns: list of dict
+        :param selected_columns: list of the few columns selected in the sample query. It has the format:
+                {"name": col_name, "type": col_type, "Counter": frequency_of_values}\
+        """
         pass
+
+    def find_best_distributed_column(self, selected_columns):
+        """Look at the statistics from the sample to estimate which column has the best distribution to do a GROUP BY
+
+        The best column is automatically saved in the attribute _group_by_column. If all the selected columns have a
+        poor distribution, then we exit with error.
+        We say that we have a poor distribution if the most frequent value of a column is superior than
+        max_frequent_number.
+        Then, the best column is the one that has not a poor distribution, and whose sum of apparitions of the 50 most
+        frequent values is minimal.
+
+        :type selected_columns: list of dict
+        :param selected_columns: list of the few columns selected in the sample query. It has the format:
+                {"name": col_name, "type": col_type, "Counter": frequency_of_values}
+        """
+        max_frequent_number = self.tc.sample_rows_number * self.tc.max_percent_most_frequent_value_in_column // 100
+        minimum_weight = sys.maxint
+        highest_first = max_frequent_number
+
+        for col in selected_columns:
+            highest = col["Counter"].most_common(1)[0]
+            if highest[1] > max_frequent_number:
+                logging.debug(
+                    "Discarding column '%s' because '%s' was found in sample %i times (higher than limit of %i)",
+                    col["name"], highest[0], highest[1], max_frequent_number)
+                continue
+            # The biggest value is not too high, so let's see how big are the 50 biggest values
+            weight_of_most_frequent_values = sum([x[1] for x in col["Counter"]
+                                                 .most_common(self.tc.number_of_most_frequent_values_to_weight)])
+            logging.debug("%s: sum up of the %i most frequent apparitions: %i", col["name"],
+                          self.tc.number_of_most_frequent_values_to_weight, weight_of_most_frequent_values)
+            if weight_of_most_frequent_values < minimum_weight:
+                self._group_by_column = col["name"]  # we save here this potential "best group-by" column
+                minimum_weight = weight_of_most_frequent_values
+                highest_first = highest[1]
+
+        if self._group_by_column is None:
+            sys.exit("Error: we could not find a suitable column to do a Group By. Either relax the selection condition"
+                     " with the '--max-gb-percent' option or directly select the column with '--group-by-column' ")
+        logging.info("Best column to do a GROUP BY is %s (apparitions of most frequent value: %i / the %i most frequent"
+                     "values sum up %i apparitions)", self._group_by_column, highest_first,
+                     self.tc.number_of_most_frequent_values_to_weight, minimum_weight)
+
+    def filter_columns_from_cli(self, all_columns):
+        """Filter the columns received from the table schema with the options given by the user, and save this result
+
+        :type all_columns: list of dict
+        :param all_columns: each column in the table is represented by an element in the list, with the following
+                format: {"name": col_name, "type": col_type}
+        """
+        if self.column_range == ":":
+            if self.chosen_columns is not None:  # user has declared the columns he wants to analyze
+                leftover = list(self.chosen_columns)
+                for col in all_columns:
+                    if col['name'] in leftover:
+                        leftover.remove(col['name'])
+                        self._ddl_columns.append(col)
+                if len(leftover) > 0:
+                    sys.exit("Error: you asked to analyze the columns %s but we could not find them in the table %s"
+                             % (str(leftover), self.get_id_string()))
+            else:
+                self._ddl_columns = all_columns
+        else:  # user has requested a specific range of columns
+            match = re.match(r'(\d*):(\d*)', self.column_range)
+            if match is None:
+                raise ValueError("The column range must follow the Python style '1:9'. You gave: %s", self.column_range)
+
+            start = 0
+            if len(match.group(1)) > 0:
+                start = int(match.group(1))
+            end = len(all_columns)
+            if len(match.group(2)) > 0:
+                end = int(match.group(2))
+            self._ddl_columns = all_columns[start:end]
+            logging.debug("The range of columns has been reduced to: %s", self._ddl_columns)
+
+        if self.ignore_columns is not None:
+            all_columns = []
+            for col in self._ddl_columns:
+                if not col['name'] in self.ignore_columns:
+                    all_columns.append(col)
+            self._ddl_columns = list(all_columns)
 
     @abstractmethod
     def create_sql_groupby_count(self):
@@ -391,6 +499,8 @@ class TableComparator(object):
         self.block_size = 5  # 5 columns means that when we want to debug we have enough context. But it small enough to
         #  avoid being charged too much by Google when querying on it
         reload(sys)
+        # above method really exists (don't know why PyCharm cannot see it) and is really needed
+        # noinspection PyUnresolvedReferences
         sys.setdefaultencoding('utf-8')
 
     def set_tsrc(self, table):
@@ -488,8 +598,8 @@ class TableComparator(object):
             logging.warning("Some important skew (threshold: %i) was detected in the Group By column %s. The top values"
                             " are: %s", self.skew_threshold, self.tsrc.get_groupby_column(), str(skew.most_common(10)))
             if len(summary_differences) == 0:
-                sys.exit("No difference in Group By count was detected but we saw some important skew that could make"
-                         "the next step (comparison of the shas) very slow or failing. So better stopping now. You"
+                sys.exit("No difference in Group By count was detected but we saw some important skew that could make "
+                         "the next step (comparison of the shas) very slow or failing. So better stopping now. You "
                          "should consider choosing another Group By column with the '--group-by-column' option")
         if len(summary_differences) != 0:
             logging.info("We found at least %i differences in Group By count", len(summary_differences))
@@ -772,8 +882,10 @@ class TableComparator(object):
 
          :type file_name: str
          :param file_name: prefix of the path where will be written the temporary files
+
+         :type col_description: str
+         :param col_description: "," separated list of the 5 extra columns from the column block we show in the diff
          """
-        # TODO doc
         sorted_file = {}
         keys = result.keys()
         for instance in keys:
@@ -825,7 +937,7 @@ class TableComparator(object):
 
     def synchronise_tables(self):
         """Ensure that some specific properties between the 2 tables have the same values, like the Group By column"""
-        self.tdst._ddl_columns = self.tsrc.get_ddl_columns()  # TODO we should have the same with BQ and have
+        self.tdst._ddl_columns = self.tsrc.get_ddl_columns()
         # a check DDL comparison
         self.tdst._group_by_column = self.tsrc.get_groupby_column()  # the Group By must use the same column for both
         # tables
@@ -936,13 +1048,30 @@ def parse_arguments():
     group_log.add_argument("-v", "--verbose", help="show debug information", action="store_true")
     group_log.add_argument("-q", "--quiet", help="only show important information", action="store_true")
 
-    # TODO put mode to partition, to choose the size of the blocks, etc
-
     return parser.parse_args()
 
 
 def create_table_from_args(definition, options, where, args, tc):
-    # TODO doc
+    """Create and returns a _Table object based on some arguments that were received on the command line
+
+    :type definition: str
+    :param definition: basic definition of the table, in the format: <type>/<database>.<table>
+
+    :type options: str
+    :param options: JSON representation of options for this table. Ex: {'project': 'myGoogleCloudProject'}
+
+    :type where: str
+    :param where: SQL filter that will be put in the WHERE clause, to limit the scope of the table analysed.
+
+    :type args: :class:`ArgumentParser`
+    :param args: object containing all the arguments from the command line
+
+    :type tc: :class:`TableComparator`
+    :param tc: current TableComparator instance, so that the table has a pointer to general configuration
+
+    :rtype: :class:`_Table`
+    :returns: The _Table object, fully configured
+    """
     table = _Table.create_table_from_string(definition, options, tc)
     table.set_where_condition(where)
     table.set_column_range(args.column_range)
