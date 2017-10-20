@@ -32,35 +32,37 @@ class _Table(ABC):
     :type column_range: str
     :param column_range: Python array range that represents the range of columns in the DDL that we want to compare
 
+    :type chosen_columns: str
+    :param chosen_columns: list of the (str) columns we want to focus on
+
+    :type ignore_columns: str
+    :param ignore_columns: list of the (str) columns we want to ignore
+
+    :type decodeCP1252_columns: str
+    :param decodeCP1252_columns: list of the (str) columns that are encoded in CP1252 and we want to transform into
+            Google's UTF8 encoding
+
     :type where_condition: str
     :param where_condition: boolean SQL condition that will be added to the WHERE condition of all the queries for that
                             table, so that we can restrict the analysis to a specific scope. Also quite useful when
                             we want to work on specific partitions.
 
-    :type table: str
-    :param table: Name of the table
-
-    :type table: str
-    :param table: Name of the table
-
+    :type full_name: str
+    :param full_name: the full name of the table: <database>.<table>
     """
-    # TODO more description
 
     __metaclass__ = ABCMeta
 
     def __init__(self, database, table, parent, *args, **kwargs):
-        """"Represent an abstract table that contains database connection and the related SQL executions"""
         self.database = database
         self.table = table
         self.tc = parent
         self.column_range = ":"
-        self.chosen_columns = None  # list of the (str) columns we want to focus on.
+        self.chosen_columns = None
         self.ignore_columns = None
+        self.decodeCP1252_columns = list()
         self.where_condition = None
-        """str: Docstring *after* attribute, with type specified."""
         self.full_name = database + '.' + table
-        #: list of str: Doc comment *before* attribute, with type specified
-        self.connection = self._create_connection()
         self._ddl_columns = []  # array instead of dictionary because we want to maintain the order of the columns
         self._ddl_partitions = []  # take care, those rows also appear in the columns array
         self._group_by_column = None  # the column that is used to "bucket" the rows
@@ -173,6 +175,9 @@ class _Table(ABC):
 
     def set_ignore_columns(self, cols):
         self.ignore_columns = cols.split(",")
+
+    def set_decode_cp1252_columns(self, cols):
+        self.decodeCP1252_columns = cols.split(",")
 
     def set_group_by_column(self, col):
         self._group_by_column = col
@@ -1032,9 +1037,13 @@ def parse_arguments():
                                     " want to check. Example: 'column1,column14,column23'")
 
     parser.add_argument("--ignore-columns",
-                        help="the column in argument will be ignored from analysis. Example: 'column1,column14,"
+                        help="the columns in argument will be ignored from analysis. Example: 'column1,column14,"
                              "column23'")  # not in the group_columns, because we want to be able to ask for a range
     # of columns but removing some few at the same time
+
+    parser.add_argument("--decodeCP1252-columns",
+                        help="try to transform the CP1252 encoding from the (string) columns in argument into "
+                             "Google's UTF8 encoding (Experimental). Example: 'column1,column14,column23'")
 
     parser.add_argument("--group-by-column",
                         help="the column in argument is enforced to be the Group By column. Can be useful if the sample"
@@ -1079,6 +1088,8 @@ def create_table_from_args(definition, options, where, args, tc):
         table.set_chosen_columns(args.columns)
     if args.ignore_columns is not None:
         table.set_ignore_columns(args.ignore_columns)
+    if args.decodeCP1252_columns is not None:
+        table.set_decode_cp1252_columns(args.decodeCP1252_columns)
     table.set_group_by_column(args.group_by_column)  # if not defined, then it's None and we'll compute it later
 
     return table

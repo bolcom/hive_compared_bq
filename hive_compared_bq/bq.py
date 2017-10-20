@@ -33,6 +33,7 @@ class TBigQuery(_Table):
         self.project = project  # the Google Cloud project where this dataset/table belongs.If Null, then the default
         #  environment where this script is executed is used.
         _Table.__init__(self, database, table, parent)
+        self.connection = self._create_connection()
 
         # check that we can reach dataset and table
         dataset = self.connection.dataset(database)

@@ -30,6 +30,7 @@ hive_compared_bq tackles this problem by:
       - [Skewing problem](#skewing-problem)
       - [Schema not matching](#schema-not-matching)
       - [HBase tables](#hbase-tables)
+      - [Encoding differences between Hive and BigQuery](#encoding-differences-between-hive-and-bigquery)
       - [Problems in the selection of the GroupBy column](#problems-in-the-selection-of-the-groupby-column)
   * [Algorithm](#algorithm)
     + [Imprecision due to "float" of "double" types](#imprecision-due-to--float--of--double--types)
@@ -284,6 +285,12 @@ To overcome this, there are 2 possibilities:
 It is possible to do also the comparison with some HBase tables.<br/>
 To do so, you need to create a Hive table with a HBase backend (see documentation: https://cwiki.apache.org/confluence/display/Hive/HBaseIntegration ).<br/>
 Be aware that Hive on top HBase has some limitations, so you won't be able to check all the data in your HBase tables (for instance: you cannot see the timestamps, or older versions of a cell, and all the columns must be properly defined in the Hive schema).
+
+#### Encoding differences between Hive and BigQuery
+
+All the data that is internally stored by BigQuery is automatically saved with an UTF8 encoding. That can give some problems when some strings in Hive are using another encoding: the byte representation between each column may not match even if the 'texts' are the same.<br/>
+To overcoome this, a UDF has been developed in Hive in order to transform some specific columns with a CP1252 encoding into Google's UTF8 encoding.<br/>
+Use the "--decodeCP1252-columns" option to specify those columns. Take care: this is code is quite experimental and it does not guarantee that the "translation of encoding" will totally work.
 
 #### Problems in the selection of the GroupBy column
 

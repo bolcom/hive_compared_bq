@@ -13,6 +13,7 @@ class THive(_Table):
     def __init__(self, database, table, parent, hs2_server, jar_path):
         self.server = hs2_server
         _Table.__init__(self, database, table, parent)
+        self.connection = self._create_connection()
         self.jarPath = jar_path
 
     def get_type(self):
@@ -107,7 +108,7 @@ class THive(_Table):
                     hive_value_name = "cast( %s as STRING)" % name
                 elif col["type"] == 'float' or col["type"] == 'double':
                     hive_value_name = "cast( floor( %s * 10000 ) as bigint)" % name
-                elif col["type"] == 'string' and name == 'post_prop13':  # TODO unhardcode this name value
+                elif col["type"] == 'string' and name in self.decodeCP1252_columns:
                     hive_value_name = "DecodeCP1252( %s)" % name
                 hive_basic_shas += "CASE WHEN %s IS NULL THEN 'n_%s' ELSE %s END, '|'," % (name, name[:2],
                                                                                            hive_value_name)
@@ -150,8 +151,8 @@ class THive(_Table):
         logging.debug("Launching Hive query")
         #  TODO split number should be done in function of file format (ORC, Avro...) and number of columns
         #  split_maxsize = 256000000
-        split_maxsize = 64000000
-        # split_maxsize = 8000000
+        # split_maxsize = 64000000
+        split_maxsize = 8000000
         # split_maxsize = 16000000
         try:
             cur = self.connection.cursor()
@@ -168,7 +169,7 @@ class THive(_Table):
         try:
             cur = self.query(query)
             while cur.hasMoreRows:
-                row = cur.fetchone()  # TODO check if we should not do fetchall instead, or other fetch batch
+                row = cur.fetchone()
                 if row is not None:
                     if not all_columns_from_2:
                         result_dic[row[0]] = row[1]
