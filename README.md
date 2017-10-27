@@ -45,7 +45,7 @@ hive_compared_bq tackles this problem by:
 ## Installation
 
 Make sure the following software is available:
-* Python = 2.7 or 2.6 (see restrictions for 2.6)
+* Python = 2.7 or 2.6 (see [restrictions for 2.6](#note-python-version-26))
 * pyhs2 (just for Hive)
 * google.cloud.bigquery (just for BigQuery)
 
@@ -102,8 +102,8 @@ tar xvfz google-cloud-sdk-170.0.0-linux-x86_64.tar.gz
 
 This last command tells you to source 2 files in every session. So include them in your bash profile. For instance in my case it would be:
 ```bash
-echo 'source /home/sluangsay/bin/googlesdk/google-cloud-sdk/path.bash.inc' >> ~/.bash_profile
-echo 'source /home/sluangsay/bin/googlesdk/google-cloud-sdk/completion.bash.inc' >> ~/.bash_profile
+echo "source ${HOME}/bin/googlesdk/google-cloud-sdk/path.bash.inc" >> ~/.bash_profile
+echo "source ${HOME}/bin/googlesdk/google-cloud-sdk/completion.bash.inc" >> ~/.bash_profile
 ```
 Open a new bash session to activate those changes.
 
@@ -125,24 +125,24 @@ python hive_compared_bq.py --help
 
 You must indicate the 2 tables to compare as arguments (the first table will be considered as the "source" table, and the second one as the "destination" table).
 
-Each table must have the following format: "type"/"database"."table"
+Each table must have the following format: `type`/`database`.`table`
 where:
-* "type" is the technology of your database (currently, only 'hive' and 'bq' (BigQuery) are supported)
-* "database" is the name of your database (also called "dataset" in BigQuery)
-* "table" is of course the name of your table
+* `type` is the technology of your database (currently, only 'hive' and 'bq' (BigQuery) are supported)
+* `database` is the name of your database (also called "dataset" in BigQuery)
+* `table` is of course the name of your table
 
 About the location of those databases:
 * In the case of BigQuery, the default Google Cloud project configured in your environment is selected.<br/>
-If you want to specify another project, you must indicate it with the 'project' parameter with the "-s" or "-d" options.
-* In the case of Hive, you must specify the hostname of the HiveServer2, using the 'hs2' parameter with the "-s" or "-d" options.
+If you want to specify another project, you must indicate it with the `project` parameter with the `-s` or `-d` options.
+* In the case of Hive, you must specify the hostname of the HiveServer2, using the `hs2` parameter with the `-s` or `-d` options.
 
 Another note for Hive: you need to pass the HDFS direction of the jar of the required UDF (see installation of Hive above), using the 'jar' option.
 
 To clarify all the above, let's consider that we want to compare the following 2 tables:
-* A Hive table called "hive_compared_bq_table", inside the database "sluangsay".<br/>
-With those parameters, the argument to give is: "hive/sluangsay.hive_compared_bq_table".<br/>
-Let's suppose also that the hostname of HiveServer2 is 'master-003.bol.net', and that we installed the required Jar in the HDFS path 'hdfs://hdp/user/sluangsay/lib/sha1.jar'. Then, since this table is the first one on our command line, it is the source table and we need to define the option: -s "{'jar': 'hdfs://hdp/user/sluangsay/lib/sha1.jar'
-* A BigQuery table also alled "hive_compared_bq_table", inside the dataset "bidwh2".
+* A Hive table called `hive_compared_bq_table`, inside the database `sluangsay`.<br/>
+With those parameters, the argument to give is: `hive/sluangsay.hive_compared_bq_table`.<br/>
+Let's suppose also that the hostname of HiveServer2 is `master-003.bol.net`, and that we installed the required Jar in the HDFS path 'hdfs://hdp/user/sluangsay/lib/sha1.jar'. Then, since this table is the first one on our command line, it is the source table and we need to define the option: `-s "{'jar': 'hdfs://hdp/user/sluangsay/lib/sha1.jar', 'hs2': 'master-003.bol.net'}"`
+* A BigQuery table also alled `hive_compared_bq_table`, inside the dataset `bidwh2`.
 
 To compare above 2 tables, you need to execute:
 ```bash
@@ -164,14 +164,14 @@ No differences where found when doing a Count on the tables sluangsay.hive_compa
 Sha queries were done and no differences where found: the tables hive_sluangsay.hive_compared_bq_table and bigQuery_bidwh2.hive_compared_bq_table are equal!
 ```
 
-The first 2 lines describe the first step of the algorithm (see the explanation of the algorithm later), and we see that 'rowkey' is the column that is here used to perform the "Group By" operations.
-Then, the next 2 lines show the second step: we count the number of rows for each value of 'rowkey'. In that case, those values match for the 2 tables.
-Finally, we do the extensive computation of the SHAs for all the columns and rows of the 2 tables. At the end, the script tells us that our 2 tables are identical.
+The first 2 lines describe the first step of the algorithm (see the explanation of the algorithm later), and we see that `rowkey` is the column that is here used to perform the `Group By` operations.<br/>
+Then, the next 2 lines show the second step: we count the number of rows for each value of `rowkey`. In that case, those values match for the 2 tables.<br/>
+Finally, we do the extensive computation of the SHAs for all the columns and rows of the 2 tables. At the end, the script tells us that our 2 tables are identical.<br/>
 We can also check the returns value of the script: it is 0, which means no differences.
 
 #### Case of number of rows not matching
 
-The first difference that can be observed is that the number of rows associated to (at least) one GroupBy value does not match between the 2 tables.
+The first difference that can be observed is that the number of rows associated to (at least) one GroupBy value does not match between the 2 tables.<br/>
 In such case, the standard output would be similar to:
 
 ```
@@ -187,7 +187,7 @@ Some of the differences are also shown in a HTML file that is automatically open
 
 ![alt text](docs/images/differences_count.png?raw=true "Differences in GroupBy numbers")
 
-This shows a table, with the rows of 1 table on the right side, and the ones of the other table on the right side.<br/>
+This shows a table, with the rows of 1 table on the left side, and the ones of the other table on the right side.<br/>
 The names of the table appear at the top of the table.<br/>
 There we can also see the names of the columns that are shown.<br/>
 For performance reason and also sake of brevity, only some 7 columns are shown.<br/>
@@ -210,11 +210,11 @@ The return value of the script would be 1.
 
 Some of the differences are also shown in a HTML file that is automatically opened in your browser:
 
-TODO link
+![alt text](docs/images/differences_sha.png?raw=true "Differences in SHA")
 
-We can see some similar information as the one exposed for differences in the "Count validation" (see above).<br/>
-The 7 columns are: first the 2 "special columns", then the 5 columns of a "column block" (see "algorithm" section for explanations) which contains some differences. That means that at least 1 of those 5 columns has at least 1 value different.<br/>
-In our example, we can see that the 2 rows have some differences in the column "product_subgroup". Those differences are highlighted in yellow.
+We can see some similar information as the one exposed for differences in the [Count validation](#case-of-number-of-rows-not-matching).<br/>
+The 7 columns are: first the 2 "special columns", then the 5 columns of a "column block" (see [algorithm](#algorithm) for explanations) which contains some differences. That means that at least 1 of those 5 columns has at least 1 value different.<br/>
+In our example, we can see that the 2 rows have some differences in the column `product_subgroup`. Those differences are highlighted in yellow.
 
 If there are several "column blocks" that have some differences, then the program will first show the column block that contains more "row blocks" with differences (take care: that does not mean that it is the column block that contains more differences. We could have indeed a column block with just 1 row block with differences, but that 1 row block could contain 1000s of rows with differences. On the other hand, we could imagine another column block with 2 row blocks containing differences, but each row block could contain 1 single row with differences).<br/>
 Then after, the program will ask you if you wish to see another column block with differences.
@@ -226,28 +226,28 @@ Then after, the program will ask you if you wish to see another column block wit
 By default, the script executes 3 steps (see explanation on how the algorithm executes).
 You can run the script faster by removing some steps that you think are unnecessary:
 
-* with the '--group-by-column' option, you can indicate directly which column you want to use for the Group By.
+* with the `--group-by-column` option, you can indicate directly which column you want to use for the Group By.
 That means that the first step of analyzing some sample of 10 columns won't be needed.
 This step won't usually make a huge difference in the execution time (it usually takes 1-2 seconds), but by doing this you avoid launching a query that might cost you some money (example of BigQuery).
 With this option, you might also be able to provide a better column that the one the script would have discovered by itself, which might speed up the following queries (by avoiding Skew for instance, see notes later).
 
-* with the '--just-count' option, you say that you just want to do a 'count rows validation'.
+* with the `--just-count` option, you say that you just want to do a 'count rows validation'.
 This is some kind of "basic validation" because you won't be sure that the columns have some correct values.
 But that allows you to avoid the final "full SHAs validation" step, that is more expensive and timely to compute.
 And maybe this 'count' validation' is enough for you now, because you are at an early stage of development, and you don't need to be 100% sure of your data
 (checking the count of rows is also a good idea to double check if some JOINs or some Filters conditions work properly).
 Don't forget to eventually run a full SHAs validation when you finish developing.
 
-* with '--just-sha', you specify that you don't need the 'count' validation. If you know from previous executions that the counts are correct, then you might indeed to skip that previous step.
+* with `--just-sha`, you specify that you don't need the 'count' validation. If you know from previous executions that the counts are correct, then you might indeed decide to skip that previous step.
 However, it is a bit at your own risk, because if the counts are not correct, the script will fail but you will have executed a more complex/costly query for that ('count' validation use faster/cheaper queries).
 
 Another solution to have your validation being executed faster is to limit the scope of your validations. If you decide to validate less data, then you need to process less data, meaning that your queries will be faster/cheaper:
 
 * for instance, you might be interested in just validating some specific critical columns (maybe because you know that your ETL process does not make any changes on some columns, so why "validating" them?).
-In such case, you can use the '--column-range', '--columns' or '--ignore-columns' options.
+In such case, you can use the `--column-range`, `--columns` or `--ignore-columns` options.
 
 * another example would be just validating some specific partitions. If your data is partitioned by days for instance, then you might decide to only validate 1 day of data.
-In such case you have to use the '--source-where' and '--destination-where' to specify a Where condition that tells which partition you want to consider.
+In such case you have to use the `--source-where` and `--destination-where` to specify a Where condition that tells which partition you want to consider.
 
 #### Skewing problem
 
@@ -255,7 +255,7 @@ The program does several queries with some GroupBy operations. As for every Grou
 
 The "count comparison" step (see description of the algorithm to know more about the steps) does not do any complex computation, so skew is annoying but should not be a very big issue.<br/>
 However, the "SHA1 comparison" step launches some heavy queries, and skew can mean a huge difference.<br/>
-In our algorithm, skew is determined by the skew in the distribution of the GroupBy column. This is why the selection of this column in the first step of the program is crucial, and that it can mean a huge different if you specify yourself a column that has a good distribution.<br/>
+In our algorithm, skew is determined by the skew in the distribution of the GroupBy column. This is why the selection of this column in the first step of the program is crucial, and that it can mean a huge difference if you specify yourself a column that has a good distribution.<br/>
 For the above reasons, a skew detection is done during the "count comparison" step. In case a "groupBy value" appears in more than 40 000 rows (you may change this default value with the option '--skew-threshold'), then this groupBy value will be registered and a warning message like this will appear:
 ```
 Some important skew (threshold: %i) was detected in the Group By column x. The top values are:
@@ -268,17 +268,17 @@ If the "count comparison" step has not encountered any error, but some skew has 
 No difference in Group By count was detected but we saw some important skew that could make the next step (comparison of the shas) very slow or failing. So better stopping now. You should consider choosing another Group By column with the '--group-by-column' option
 ```
 As explained before, stopping at this stage is a protection to avoid launching some heavy/costly queries that have some high probability to fail.<br/>
-Should you face this situation, then your best option is to specify a GroupBy column with a better distribution with the '--group-by-column' option. Another possibility is to raise the threshold with '--skew-threshold': in such case that means that you accept and understand the risk of launching the SHA1 computations with these skewed values.
+Should you face this situation, then your best option is to specify a GroupBy column with a better distribution with the `--group-by-column` option. Another possibility is to raise the threshold with `--skew-threshold`: in such case that means that you accept and understand the risk of launching the SHA1 computations with these skewed values.
 
 #### Schema not matching
 
 To do the comparison, the program needs to first discover the schemas of the tables. What is actually done is fetching the schema of the "source table", and assuming that the "destination table" has the same schema.
 
 If the schemas between the 2 tables don't match, then by default it is not possible to compare them.<br/>
-This can easily happen for instance in partitioned tables with BigQuery, where the "column partition" is called "_PARTITIONTIME" and may not match the name of this table in Hive.<br/>
+This can easily happen for instance in partitioned tables with BigQuery, where the "column partition" is called `_PARTITIONTIME` and may not match the name of this table in Hive.<br/>
 To overcome this, there are 2 possibilities:
 * creating some views (in Hive or BigQuery) to rename or remove some columns. Take care not to make this view too complex otherwise that could lower the validity of the comparison.
-* limit the column you want to compare, using the options "--column-range", "--columns", "--ignore-columns". The problem of this approach is that you cannot rename columns.
+* limit the columns you want to compare, using the options `--column-range`, `--columns`, `--ignore-columns`. The problem of this approach is that you cannot rename columns.
 
 #### HBase tables
 
@@ -290,7 +290,7 @@ Be aware that Hive on top HBase has some limitations, so you won't be able to ch
 
 All the data that is internally stored by BigQuery is automatically saved with an UTF8 encoding. That can give some problems when some strings in Hive are using another encoding: the byte representation between each column may not match even if the 'texts' are the same.<br/>
 To overcoome this, a UDF has been developed in Hive in order to transform some specific columns with a CP1252 encoding into Google's UTF8 encoding.<br/>
-Use the "--decodeCP1252-columns" option to specify those columns. Take care: this is code is quite experimental and it does not guarantee that the "translation of encoding" will totally work.
+Use the `--decodeCP1252-columns` option to specify those columns. Take care: this is code is quite experimental and it does not guarantee that the "translation of encoding" will totally work.
 
 #### Problems in the selection of the GroupBy column
 
@@ -301,8 +301,8 @@ Error: we could not find a suitable column to do a Group By. Either relax the se
 ```
 
 If you face this problem, then just follow one of the 2 solutions proposed in the message above.<br/>
-The best solution is obviously to have some knowledge about the data and to directly indicate to the script which column is the best one to do some GroupBy, using the '--group-by-column' option.<br/>
-The other possibility is to use the '--max-gb-percent' option and to make it higher than the default value (1%), in order to allow a bit less homogeneous distribution in the data of the GroupBy column and thus have more probability to find a GroupBy column.
+The best solution is obviously to have some knowledge about the data and to directly indicate to the script which column is the best one to do some GroupBy, using the `--group-by-column` option.<br/>
+The other possibility is to use the `--max-gb-percent` option and to make it higher than the default value (1%), in order to allow a bit less homogeneous distribution in the data of the GroupBy column and thus have more probability to find a GroupBy column.
 
 ## Algorithm
 
@@ -311,10 +311,10 @@ Some of those approaches are:
 * Manual check, comparing some few rows and counting the total number of rows.<br/>
 Problem of this approach is obviously that it cannot work with a certain amount of data or with tables with lot of columns. So the check cannot be complete.
 * Doing some "JOINs" comparisons between the 2 tables.<br/>
-The drawback of this is that Joins are some quite slow operations in general. What is more, it is very difficult to do a faire comparison when there are multiple rows with the same "Join column".
-The last inconvenient is that you have to ensure that the 2 tables are located on the same place, which might force you to transfer the data from 1 database to another one (ex: from a Hive database to a BigQuery database), which takes a long time if the table is huge.
+The drawback of this is that Joins are some quite slow operations in general. What is more, it is very difficult to do a fair comparison when there are multiple rows with the same "Join column".
+The last inconvenience is that you have to ensure that the 2 tables are located on the same place, which might force you to transfer the data from 1 database to another one (ex: from a Hive database to a BigQuery database), which takes a long time if the table is huge.
 * Sorting all the rows and doing a Diff between them (just like described here: https://community.hortonworks.com/articles/1283/hive-script-to-validate-tables-compare-one-with-an.html ).<br/>
-The inconvenient with this is also that the 2 tables have to be located on the same place. What is more, the "Diff" operations occurs in memory which means that this approach does not work with huge tables.
+The inconvenience with this is also that the 2 tables have to be located on the same place. What is more, the "Diff" operations occurs in memory which means that this approach does not work with huge tables.
 
 To solve above problems, it was decided to:
 * develop an algorithm that would leverage the BigData backends (Hive, BigQuery or others): all the complicated computations must be performed on those engines that naturally scale.<br/>
@@ -339,7 +339,7 @@ The following simplified pseudo SQL query summarizes a bit this idea:
         sha1(concat(list<block_1>)) as sblock_2 ... as sblock_N FROM GROUP BY gb
 
 The real query is obviously a bit more complex, because we need to take care about type conversions, NULL values and the ordering of the rows for the same GroupBy values.<br/>
-If you feel interested in seeing the real query, launch the script with the '--verbose' option.
+If you feel interested in seeing the real query, launch the script with the `--verbose` option.
 
 The result of above query is stored in a temporary table. The size of this table is small (because we take a modulo of the HASH of the groupBy column, and because the number of columns is limited).<br/>
 Therefore, because this amount of data is reasonable, we can allow ourselves to download those results locally where our Python program is being executed.
@@ -358,33 +358,33 @@ The pseudo SQL query shown above is quite heavy to compute, and has to access al
 In order to avoid launching such a heavy query in case of "stupid mistakes" (maybe your ETL flow failed and there is 1 table that is void), a quick comparison step has been introduced before.
 In general, we can divide the program in 3 steps:
 
-* Determination of the GroupBy column.<br/>
+1. **Determination of the GroupBy column**<br/>
 In this first step, we try to assess which column is more suitable to be used as a GroupBy column.<br/>
 It is important to find a column that has many different values (otherwise, the next queries will be poorly parallelized, and we can have some OOM problems).<br/>
 We want also to avoid some skewed columns.<br/>
 To do so, the program fetch a sample of data from 1 table: some 10 000 rows and some 10 columns. We only look at 10 columns for 3 reasons: 1) we suppose that it would be enough to find there a good one 2) to limit the amount of data transfered over the network 3) to avoid being billed too much (for instance, the price in BigQuery grows with the number of columns being read).<br/>
 Finally, an analysis is done on those columns, we discard all the columns that don't have enough diversity or that are too skewed, and from the remaining columns we keep the one that seems less skewed.
 Working on a sample has some limits and it is possible that the chosen column is not the best one. It is also possible that all the 10 columns are discarded.<br/>
-In both situation you can use the '--group-by-column' option to overcome that problem.
+In both situation you can use the `--group-by-column` option to overcome that problem.
 
-* Quick count check.<br/>
+2. **Quick count check**<br/>
 The program does a first validation to quickly check, in a light way if there are some big differences in the 2 tables.<br/>
 This is why we just try to count the number of rows in the tables. More than counting the total number of rows, we will check the number of rows for each "row-bucket", that is: group of rows with a GroupBy value whose hash modulo 10000 are the same.<br/>
 This verification is fast because it just need to do some small computation on just 1 column. There is indeed no point in trying to do some very complex computation on all the columns if the number of rows does not match.<br/>
 In such case, the differences are shown to the user and the program stops, without executing the 3rd step.<br/>
 During this step, a skew detection is also performed, which is a protection for the 3rd step.
 
-* Full SHA1 validation.<br/>
+3. **Full SHA1 validation**<br/>
 This step, described earlier in this paragraph, is the only one that can guarantee that the 2 tables are identical.
 
 ### Imprecision due to "float" of "double" types
 
-Those representations of a decimal number are not always exact, and small differences in their representations can be sometimes observed between Hive and BigQuery, meaning that the corresponding SHA1 values will be totally different.<br/>
-For instance, the following query in BigQuery returns '8.5400000000000009':
+The representations of decimal numbers are not always exact, and small differences in their representations can be sometimes observed between Hive and BigQuery, meaning that the corresponding SHA1 values will be totally different.<br/>
+For instance, the following query in BigQuery returns `8.5400000000000009`:
 ```
 select  cast( cast( 8.540000000000001 as FLOAT64 ) as STRING)
 ```
-And in Hive we would get '8.540000000000001'.
+And in Hive we would get `8.540000000000001`.
 
 To overcome those problems, it was decided to:
 * multiply any float or double number by 10000 (most of the decimal numbers managed in Bol.com are 'price numbers' with just 2 digits, so multiplying by 10000 should give enough precision).
