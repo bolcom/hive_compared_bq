@@ -1,3 +1,21 @@
+"""
+
+Copyright 2017 bol.com. All Rights Reserved
+
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 import logging
 import sys
 import time
@@ -9,15 +27,15 @@ from google.cloud import bigquery
 class TBigQuery(_Table):
     """BigQuery implementation of the _Table object"""
 
-    hash2_js_udf = '''create temp function hash2(v STRING)
+    hash2_js_udf = '''create temp function hash2(text STRING)
     returns INT64
     LANGUAGE js AS """
-      if(v === null){
+      if(text === null){
         return 0  // same behaviour as in Hive
       }
-      var myHash = 0
-      for (let c of v){
-        myHash = myHash * 31 + c.charCodeAt(0)
+      let myHash = 0
+      for (let character of text){
+        myHash = myHash * 31 + character.charCodeAt(0)
         if (myHash >= 4294967296){ // because in Hive hash() is computed on integers range
           myHash = myHash % 4294967296
         }
@@ -30,9 +48,10 @@ class TBigQuery(_Table):
     '''
 
     def __init__(self, database, table, parent, project):
+        _Table.__init__(self, database, table, parent)
+
         self.project = project  # the Google Cloud project where this dataset/table belongs.If Null, then the default
         #  environment where this script is executed is used.
-        _Table.__init__(self, database, table, parent)
         self.connection = self._create_connection()
 
         # check that we can reach dataset and table
@@ -49,6 +68,7 @@ class TBigQuery(_Table):
         return "bigQuery"
 
     def _create_connection(self):
+        """Connect to the table and return the connection object that we will use to launch queries"""
         if self.project is None:
             return bigquery.Client()
         else:
@@ -165,7 +185,7 @@ class TBigQuery(_Table):
         """
         logging.debug("Launching BigQuery query")
         q = self.connection.run_sync_query(query)
-        q.timeout_ms = 600000  # 10 minute to execute the query in BQ should be more than enough. 1 minute was too short
+        q.timeout_ms = 600000  # 10 minutes to execute the BQ query should be more than enough. 1 minute was too short
         # TODO use maxResults https://cloud.google.com/bigquery/docs/reference/rest/v2/jobs/query? :
         q.use_legacy_sql = False
         q.run()
@@ -194,7 +214,7 @@ class TBigQuery(_Table):
         job.use_legacy_sql = False
         job.begin()
         time.sleep(3)  # 3 second is the minimum latency we get in BQ in general. So no need to try fetching before
-        retry_count = 300  # 10 minute (should be enough)
+        retry_count = 300  # 10 minutes (because of below time sleep of 2 seconds). This should be enough
         while retry_count > 0 and job.state != 'DONE':
             retry_count -= 1
             time.sleep(2)

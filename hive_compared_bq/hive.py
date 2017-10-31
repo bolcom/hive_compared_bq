@@ -1,3 +1,21 @@
+"""
+
+Copyright 2017 bol.com. All Rights Reserved
+
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 import logging
 import sys
 import time
@@ -11,8 +29,8 @@ class THive(_Table):
     """Hive implementation of the _Table object"""
 
     def __init__(self, database, table, parent, hs2_server, jar_path):
-        self.server = hs2_server
         _Table.__init__(self, database, table, parent)
+        self.server = hs2_server
         self.connection = self._create_connection()
         self.jarPath = jar_path
 
@@ -20,6 +38,7 @@ class THive(_Table):
         return "hive"
 
     def _create_connection(self):
+        """Connect to the table and return the connection object that we will use to launch queries"""
         return pyhs2.connect(host=self.server, port=10000, authMechanism="KERBEROS", database=self.database)
 
     def get_ddl_columns(self):
@@ -63,7 +82,7 @@ class THive(_Table):
             if fetched is not None:
                 for idx, col in enumerate(selected_columns):
                     value_column = fetched[idx]
-                    col["Counter"][value_column] += 1  # TODO what happens with NULL? (case of globalid in Omniture)
+                    col["Counter"][value_column] += 1  # TODO what happens with NULL?
         cur.close()
 
     def create_sql_groupby_count(self):
@@ -178,8 +197,9 @@ class THive(_Table):
         except:
             result_dic["error"] = sys.exc_info()[1]
             raise
+        finally:
+            cur.close()
         logging.debug("All %i Hive rows fetched", len(result_dic))
-        cur.close()
 
     def launch_query_csv_compare_result(self, query, rows):
         cur = self.query(query)
@@ -196,12 +216,13 @@ class THive(_Table):
             cur = self.query("add jar " + self.jarPath)  # must be in a separated execution
             cur.execute("create temporary function SHA1 as 'org.apache.hadoop.hive.ql.udf.UDFSha1'")
             cur.execute("create temporary function DecodeCP1252 as "
-                        "'org.apache.hadoop.hive.ql.udf.generic.GenericUDFRemoveControlChar'")  # TODO change class name
+                        "'org.apache.hadoop.hive.ql.udf.generic.GenericUDFDecodeCP1252'")
         except:
             result["error"] = sys.exc_info()[1]
             raise
 
         if "error" in result:
+            cur.close()
             return  # let's stop the thread if some error popped up elsewhere
 
         tmp_table = "%s.temp_hiveCmpBq_%s_%s" % (self.database, self.full_name.replace('.', '_'),

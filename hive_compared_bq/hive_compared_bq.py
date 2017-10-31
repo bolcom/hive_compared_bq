@@ -1,3 +1,21 @@
+"""
+
+Copyright 2017 bol.com. All Rights Reserved
+
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
 import argparse
 import ast
 import logging
@@ -60,9 +78,9 @@ class _Table(ABC):
         self.column_range = ":"
         self.chosen_columns = None
         self.ignore_columns = None
-        self.decodeCP1252_columns = list()
+        self.decodeCP1252_columns = []
         self.where_condition = None
-        self.full_name = database + '.' + table
+        self.full_name = self.database + '.' + self.table
         self._ddl_columns = []  # array instead of dictionary because we want to maintain the order of the columns
         self._ddl_partitions = []  # take care, those rows also appear in the columns array
         self._group_by_column = None  # the column that is used to "bucket" the rows
@@ -95,7 +113,7 @@ class _Table(ABC):
                 hash_options = ast.literal_eval(stdin_options)
             except:
                 raise ValueError("The option must be in a Python dictionary format (just like: {'jar': "
-                                 "'hdfs://hdp/user/sluangsay/lib/sha1.jar', 'hs2': 'master-003.bol.net'}\nThe value "
+                                 "'hdfs://hdp/user/sluangsay/lib/hcbq.jar', 'hs2': 'master-003.bol.net'}\nThe value "
                                  "received was: %s" % stdin_options)
 
             for key in hash_options:
@@ -121,7 +139,7 @@ class _Table(ABC):
 
         :type options: str
         :param options: the dictionary of all the options for this table connection. Could be for instance:
-                         "{'jar': 'hdfs://hdp/user/sluangsay/lib/sha1.jar', 'hs2': 'master-003.bol.net'}"
+                         "{'jar': 'hdfs://hdp/user/sluangsay/lib/hcbq.jar', 'hs2': 'master-003.bol.net'}"
 
         :type table_comparator: :class:`TableComparator`
         :param table_comparator: the TableComparator parent object, to have a reference to the configuration properties
@@ -148,7 +166,7 @@ class _Table(ABC):
             from hive import THive
             return THive(database, table, table_comparator, hash_options['hs2'], hash_options.get('jar'))
         else:
-            raise ValueError("The database type %s is not implemented" % typedb)
+            raise ValueError("The database type %s is currently not supported" % typedb)
 
     @abstractmethod
     def get_type(self):
@@ -183,27 +201,22 @@ class _Table(ABC):
         self._group_by_column = col
 
     @abstractmethod
-    def _create_connection(self):
-        """Connect to the table and return the connection object that we will use to launch queries"""
-        pass
-
-    @abstractmethod
     def get_ddl_columns(self):
         """ Return the columns of this table
 
-        The list of the column is an attribute of the class. If it already exists, then it is directly returns.
-        Otherwise, a connection is made to the database to get the schema of the table, and at the same time the
-        attribute (list) partition is also filled.
+        The list of the column is an attribute of the class. If it already exists, then it is directly returned.
+        Otherwise, a connection is made to the database to get the schema of the table and at the same time the
+        attribute (list) partition is filled.
 
         :rtype: list of dict
-        :returns: list of {"name", "type"} dictionaries that represent the columns of this table
+        :returns: list of {"name": "type"} dictionaries that represent the columns of this table
         """
         pass
 
     def get_groupby_column(self):
         """Return a column that seems to have a good distribution in order to do interesting GROUP BY queries with it
 
-        This _group_by_column is an attribute of the class. If it already exists, then it is directly returns.
+        This _group_by_column is an attribute of the class. If it already exists, then it is directly returned.
         Otherwise, a small query to get some sample rows on some few columns is performed, in order to evaluate
         which of those columns present the best distribution (we want a column that will have as many Group By values
         as possible, and that avoid a bit the skew, so that when we detect a specific difference on a bucket, we will
@@ -238,7 +251,7 @@ class _Table(ABC):
 
         :type selected_columns: list of dict
         :param selected_columns: list of the few columns selected in the sample query. It has the format:
-                {"name": col_name, "type": col_type, "Counter": frequency_of_values}\
+                {"name": col_name, "type": col_type, "Counter": frequency_of_values}
         """
         pass
 
@@ -249,7 +262,7 @@ class _Table(ABC):
         poor distribution, then we exit with error.
         We say that we have a poor distribution if the most frequent value of a column is superior than
         max_frequent_number.
-        Then, the best column is the one that has not a poor distribution, and whose sum of apparitions of the 50 most
+        Then, the best column is the one that has not a poor distribution, and whose sum of occurrences of the 50 most
         frequent values is minimal.
 
         :type selected_columns: list of dict
@@ -257,32 +270,35 @@ class _Table(ABC):
                 {"name": col_name, "type": col_type, "Counter": frequency_of_values}
         """
         max_frequent_number = self.tc.sample_rows_number * self.tc.max_percent_most_frequent_value_in_column // 100
-        minimum_weight = sys.maxint
+        current_lowest_weight = sys.maxint
         highest_first = max_frequent_number
 
         for col in selected_columns:
             highest = col["Counter"].most_common(1)[0]
-            if highest[1] > max_frequent_number:
+            value_most_popular = highest[0]
+            frequency_most_popular_value = highest[1]
+            if frequency_most_popular_value > max_frequent_number:
                 logging.debug(
                     "Discarding column '%s' because '%s' was found in sample %i times (higher than limit of %i)",
-                    col["name"], highest[0], highest[1], max_frequent_number)
+                    col["name"], value_most_popular, frequency_most_popular_value, max_frequent_number)
                 continue
             # The biggest value is not too high, so let's see how big are the 50 biggest values
             weight_of_most_frequent_values = sum([x[1] for x in col["Counter"]
                                                  .most_common(self.tc.number_of_most_frequent_values_to_weight)])
-            logging.debug("%s: sum up of the %i most frequent apparitions: %i", col["name"],
+            logging.debug("%s: sum up of the %i most frequent occurrence: %i", col["name"],
                           self.tc.number_of_most_frequent_values_to_weight, weight_of_most_frequent_values)
-            if weight_of_most_frequent_values < minimum_weight:
+            if weight_of_most_frequent_values < current_lowest_weight:
                 self._group_by_column = col["name"]  # we save here this potential "best group-by" column
-                minimum_weight = weight_of_most_frequent_values
-                highest_first = highest[1]
+                current_lowest_weight = weight_of_most_frequent_values
+                highest_first = frequency_most_popular_value
 
         if self._group_by_column is None:
             sys.exit("Error: we could not find a suitable column to do a Group By. Either relax the selection condition"
                      " with the '--max-gb-percent' option or directly select the column with '--group-by-column' ")
-        logging.info("Best column to do a GROUP BY is %s (apparitions of most frequent value: %i / the %i most frequent"
-                     "values sum up %i apparitions)", self._group_by_column, highest_first,
-                     self.tc.number_of_most_frequent_values_to_weight, minimum_weight)
+
+        logging.info("Best column to do a GROUP BY is %s (occurrences of most frequent value: %i / the %i most frequent"
+                     "values sum up %i occurrences)", self._group_by_column, highest_first,
+                     self.tc.number_of_most_frequent_values_to_weight, current_lowest_weight)
 
     def filter_columns_from_cli(self, all_columns):
         """Filter the columns received from the table schema with the options given by the user, and save this result
@@ -311,12 +327,16 @@ class _Table(ABC):
             start = 0
             if len(match.group(1)) > 0:
                 start = int(match.group(1))
+
             end = len(all_columns)
             if len(match.group(2)) > 0:
                 end = int(match.group(2))
+
             self._ddl_columns = all_columns[start:end]
             logging.debug("The range of columns has been reduced to: %s", self._ddl_columns)
 
+        # Even if the user requested just a specific range of columns, he still has the possibility to remove some
+        # columns in that range:
         if self.ignore_columns is not None:
             all_columns = []
             for col in self._ddl_columns:
@@ -504,7 +524,7 @@ class TableComparator(object):
         self.block_size = 5  # 5 columns means that when we want to debug we have enough context. But it small enough to
         #  avoid being charged too much by Google when querying on it
         reload(sys)
-        # above method really exists (don't know why PyCharm cannot see it) and is really needed
+        # below method really exists (don't know why PyCharm cannot see it) and is really needed
         # noinspection PyUnresolvedReferences
         sys.setdefaultencoding('utf-8')
 
@@ -535,7 +555,7 @@ class TableComparator(object):
     def set_max_percent_most_frequent_value_in_column(self, percent):
         """Set the max_percent_most_frequent_value_in_column value
 
-        If in one sample a column has a value whose frequency is highest than this percentage, then this column is not
+        If in one sample a column has a value whose frequency is higher than this percentage, then this column is not
         considered as a suitable column to do the Group By
 
         :type percent: float
@@ -606,6 +626,7 @@ class TableComparator(object):
                 sys.exit("No difference in Group By count was detected but we saw some important skew that could make "
                          "the next step (comparison of the shas) very slow or failing. So better stopping now. You "
                          "should consider choosing another Group By column with the '--group-by-column' option")
+
         if len(summary_differences) != 0:
             logging.info("We found at least %i differences in Group By count", len(summary_differences))
             logging.debug("Differences in Group By count are: %s", summary_differences[:300])
@@ -622,14 +643,8 @@ class TableComparator(object):
         :type big_small_bucket: tuple
         :param big_small_bucket: tuple containing the table that has the biggest distribution (according to the Group By
          column) and then the other table
-
-        :rtype: bool
-        :returns: True if we haven't found differences yet and further analysis is needed
         """
-        if len(summary_differences) == 0:
-            print("No differences where found when doing a Count on the tables %s and %s and grouping by on the "
-                  "column %s" % (self.tsrc.full_name, self.tdst.full_name, self.tsrc.get_groupby_column()))
-            return True  # means that we should continue executing the script
+        # TODO break/refactor a bit this function in the same way it has been done for the sha part
 
         # We want to return at most 6 blocks of lines corresponding to different group by values. For the sake of
         # brevity, each block should not show more than 70 lines. Blocks that show rows that appear in only on 1 table
@@ -714,7 +729,6 @@ class TableComparator(object):
         logging.debug("Sorted results of the queries are in the files %s and %s. HTML differences are in %s",
                       sorted_file["big_rows"], sorted_file["small_rows"], html_file)
         webbrowser.open("file://" + html_file, new=2)
-        return False  # no need to execute the script further since errors have already been spotted
 
     def compare_shas(self):
         """Runs the final queries on Hive and BigQuery to check if the checksum match and return the list of differences
@@ -770,9 +784,11 @@ class TableComparator(object):
                          "'count' verification step!" % (k, self.tdst.get_id_string(), self.tsrc.get_id_string()))
             elif v != result["sha_dictionaries"][self.tsrc.get_id_string()][k]:
                 list_differences.append(k)
+
         if len(list_differences) != 0:
             logging.info("We found %i differences in sha verification", len(list_differences))
             logging.debug("Differences in sha are: %s", list_differences[:300])
+
         return list_differences, result["names_sha_tables"], result["cleaning"]
 
     def get_column_blocks_most_differences(self, differences, temp_tables):
@@ -839,9 +855,12 @@ class TableComparator(object):
         # bucket1   0   A
         # bucket1   1   B
         # In such case, the 'grouped sha of each column' will be always the same. But the sha-lines will be different
+        # That leads to a bad situation where the program says that there are some differences but it  is not possible
+        # to show them on the the web page (which is quite confusing for the user running the program).
         if len(column_blocks_most_differences) == 0:
             raise RuntimeError("Program faced some collisions when trying to assess which blocks of columns were not"
                                "correct. Please contact the developer to ask for a fix")
+
         return column_blocks_most_differences, map_colblocks_bucketrows
 
     def get_sql_final_differences(self, column_blocks_most_differences, map_colblocks_bucketrows, index):
@@ -874,7 +893,7 @@ class TableComparator(object):
 
         src_final_sql = self.tsrc.create_sql_show_bucket_columns(list_column_to_check, list_hashs)
         dst_final_sql = self.tdst.create_sql_show_bucket_columns(list_column_to_check, list_hashs)
-        logging.debug("Final source query is: %s   -   Final dest query is: %s", src_final_sql, dst_final_sql)
+        logging.debug("Final source query is: %s \nFinal dest query is: %s", src_final_sql, dst_final_sql)
 
         return src_final_sql, dst_final_sql, list_column_to_check
 
@@ -955,7 +974,14 @@ class TableComparator(object):
         """
         self.synchronise_tables()
         diff, big_small = self.compare_groupby_count()
-        return self.show_results_count(diff, big_small)
+
+        if len(diff) == 0:
+            print("No differences were found when doing a Count on the tables %s and %s and grouping by on the "
+                  "column %s" % (self.tsrc.full_name, self.tdst.full_name, self.tsrc.get_groupby_column()))
+            return True  # means that we should continue executing the script
+
+        self.show_results_count(diff, big_small)
+        return False  # no need to execute the script further since errors have already been spotted
 
     @staticmethod
     def clean_step_sha(tables_to_clean):
@@ -972,7 +998,7 @@ class TableComparator(object):
         self.synchronise_tables()
         sha_differences, temporary_tables, tables_to_clean = self.compare_shas()
         if len(sha_differences) == 0:
-            print("Sha queries were done and no differences where found: the tables %s and %s are equal!"
+            print("Sha queries were done and no differences were found: the tables %s and %s are equal!"
                   % (self.tsrc.get_id_string(), self.tdst.get_id_string()))
             TableComparator.clean_step_sha(tables_to_clean)
             sys.exit(0)
@@ -1009,7 +1035,7 @@ def parse_arguments():
                                             "Format follows the one for the source table")
 
     parser.add_argument("-s", "--source-options", help="options for the source table\nFor Hive that could be: {'jar': "
-                                                       "'hdfs://hdp/user/sluangsay/lib/sha1.jar', 'hs2': "
+                                                       "'hdfs://hdp/user/sluangsay/lib/hcbq.jar', 'hs2': "
                                                        "'master-003.bol.net'}\nExample for BigQuery: {'project': "
                                                        "'myGoogleCloudProject'}")
     parser.add_argument("-d", "--destination-options", help="options for the destination table")
@@ -1020,7 +1046,7 @@ def parse_arguments():
     parser.add_argument("--destination-where", help="the WHERE condition we want to apply for the destination table")
 
     parser.add_argument("--max-gb-percent", type=float, default=1.0,
-                        help="if in one sample a column has a value whose frequency is highest than this percentage, "
+                        help="if in one sample a column has a value whose frequency is higher than this percentage, "
                              "then this column is discarded (default: 1.0)")
 
     parser.add_argument("--skew-threshold", type=int,

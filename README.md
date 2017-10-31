@@ -16,7 +16,7 @@ hive_compared_bq tackles this problem by:
     + [Note Python version 2.6](#note-python-version-26)
     + [Installing Python 2.7](#installing-python-27)
     + [For Hive](#for-hive)
-      - [TODO: explain the installation of Jar + give source code](#todo--explain-the-installation-of-jar---give-source-code)
+      - [Installation of the required UDF](#installation-of-the-required-udf)
     + [For Big Query](#for-big-query)
   * [Usage](#usage)
     + [Get Help](#get-help)
@@ -43,6 +43,8 @@ hive_compared_bq tackles this problem by:
 * Detection of skew
 
 ## Installation
+
+This software works with Mac (tested on 10.11 and 10.12) and on Linux (tested on Redhat 6). It is not expected to work on Windows.
 
 Make sure the following software is available:
 * Python = 2.7 or 2.6 (see [restrictions for 2.6](#note-python-version-26))
@@ -79,7 +81,11 @@ pip install pyhs2
 ```
 
 
-#### TODO: explain the installation of Jar + give source code
+#### Installation of the required UDF
+
+On the Hadoop cluster where Hive executes, you must copy the library: `udf/hcbq.jar` (this jar contains 2 UDFs: one to compute the SHA1s, and the other to handle encoding translation).
+
+Place this Jar on a HDFS directory where you have read access (in the example below, we will consider that this jar has been copied in `/user/sluangsay/lib/hcbq.jar`).
 
 ### For Big Query
 
@@ -141,12 +147,12 @@ Another note for Hive: you need to pass the HDFS direction of the jar of the req
 To clarify all the above, let's consider that we want to compare the following 2 tables:
 * A Hive table called `hive_compared_bq_table`, inside the database `sluangsay`.<br/>
 With those parameters, the argument to give is: `hive/sluangsay.hive_compared_bq_table`.<br/>
-Let's suppose also that the hostname of HiveServer2 is `master-003.bol.net`, and that we installed the required Jar in the HDFS path 'hdfs://hdp/user/sluangsay/lib/sha1.jar'. Then, since this table is the first one on our command line, it is the source table and we need to define the option: `-s "{'jar': 'hdfs://hdp/user/sluangsay/lib/sha1.jar', 'hs2': 'master-003.bol.net'}"`
+Let's suppose also that the hostname of HiveServer2 is `master-003.bol.net`, and that we installed the required Jar in the HDFS path 'hdfs://hdp/user/sluangsay/lib/hcbq.jar'. Then, since this table is the first one on our command line, it is the source table and we need to define the option: `-s "{'jar': 'hdfs://hdp/user/sluangsay/lib/hcbq.jar', 'hs2': 'master-003.bol.net'}"`
 * A BigQuery table also alled `hive_compared_bq_table`, inside the dataset `bidwh2`.
 
 To compare above 2 tables, you need to execute:
 ```bash
-python hive_compared_bq.py -s "{'jar': 'hdfs://hdp/user/sluangsay/lib/sha1.jar', 'hs2': 'master-003.bol.net'}" hive/sluangsay.hive_compared_bq_table bq/bidwh2.hive_compared_bq_table
+python hive_compared_bq.py -s "{'jar': 'hdfs://hdp/user/sluangsay/lib/hcbq.jar', 'hs2': 'master-003.bol.net'}" hive/sluangsay.hive_compared_bq_table bq/bidwh2.hive_compared_bq_table
 ```
 
 ### Explanation of results
@@ -157,11 +163,11 @@ When executing above command, if the 2 tables have exactly the same data, then w
 
 ```
 [INFO]  [2017-09-15 10:59:20,851]  (MainThread) Analyzing the columns ['rowkey', 'calc_timestamp', 'categorization_step', 'dts_modified', 'global_id', 'product_category', 'product_group', 'product_subgroup', 'product_subsubgroup', 'unit'] with a sample of 10000 values
-[INFO]  [2017-09-15 10:59:22,285]  (MainThread) Best column to do a GROUP BY is rowkey (apparitions of most frequent value: 1 / the 50 most frequentvalues sum up 50 apparitions)
+[INFO]  [2017-09-15 10:59:22,285]  (MainThread) Best column to do a GROUP BY is rowkey (occurrences of most frequent value: 1 / the 50 most frequentvalues sum up 50 occurrences)
 [INFO]  [2017-09-15 10:59:22,286]  (MainThread) Executing the 'Group By' Count queries for sluangsay.hive_compared_bq_table (hive) and bidwh2.hive_compared_bq_table (bigQuery) to do first comparison
-No differences where found when doing a Count on the tables sluangsay.hive_compared_bq_table and bidwh2.hive_compared_bq_table and grouping by on the column rowkey
+No differences were found when doing a Count on the tables sluangsay.hive_compared_bq_table and bidwh2.hive_compared_bq_table and grouping by on the column rowkey
 [INFO]  [2017-09-15 10:59:48,727]  (MainThread) Executing the 'shas' queries for hive_sluangsay.hive_compared_bq_table and bigQuery_bidwh2.hive_compared_bq_table to do final comparison
-Sha queries were done and no differences where found: the tables hive_sluangsay.hive_compared_bq_table and bigQuery_bidwh2.hive_compared_bq_table are equal!
+Sha queries were done and no differences were found: the tables hive_sluangsay.hive_compared_bq_table and bigQuery_bidwh2.hive_compared_bq_table are equal!
 ```
 
 The first 2 lines describe the first step of the algorithm (see the explanation of the algorithm later), and we see that `rowkey` is the column that is here used to perform the `Group By` operations.<br/>
@@ -176,7 +182,7 @@ In such case, the standard output would be similar to:
 
 ```
 [INFO]	[2017-09-18 08:09:06,947]  (MainThread) Analyzing the columns ['rowkey', 'calc_timestamp', 'categorization_step', 'dts_modified', 'global_id', 'product_category', 'product_group', 'product_subgroup', 'product_subsubgroup', 'unit'] with a sample of 10000 values
-[INFO]	[2017-09-18 08:09:07,739]  (MainThread) Best column to do a GROUP BY is rowkey (apparitions of most frequent value: 1 / the 50 most frequentvalues sum up 50 apparitions)
+[INFO]	[2017-09-18 08:09:07,739]  (MainThread) Best column to do a GROUP BY is rowkey (occurrences of most frequent value: 1 / the 50 most frequentvalues sum up 50 occurrences)
 [INFO]	[2017-09-18 08:09:07,739]  (MainThread) Executing the 'Group By' Count queries for sluangsay.hive_compared_bq_table2 (hive) and bidwh2.hive_compared_bq_table2 (bigQuery) to do first comparison
 [INFO]	[2017-09-18 08:09:35,392]  (MainThread) We found at least 3 differences in Group By count
 ```
@@ -200,7 +206,7 @@ If the numbers of rows match it is still possible to observe some differences in
 
 ```
 [INFO]	[2017-09-28 05:53:55,890]  (MainThread) Analyzing the columns ['rowkey', 'calc_timestamp', 'categorization_step', 'dts_modified', 'global_id', 'product_category', 'product_group', 'product_subgroup', 'product_subsubgroup', 'unit'] with a sample of 10000 values
-[INFO]	[2017-09-28 05:53:56,897]  (MainThread) Best column to do a GROUP BY is rowkey (apparitions of most frequent value: 1 / the 50 most frequentvalues sum up 50 apparitions)
+[INFO]	[2017-09-28 05:53:56,897]  (MainThread) Best column to do a GROUP BY is rowkey (occurrences of most frequent value: 1 / the 50 most frequentvalues sum up 50 occurrences)
 [INFO]	[2017-09-28 05:53:56,897]  (MainThread) Executing the 'shas' queries for hive_sluangsay.hive_compared_bq_table3 and bigQuery_bidwh2.hive_compared_bq_table3 to do final comparison
 [INFO]	[2017-09-28 05:54:26,961]  (MainThread) We found 2 differences in sha verification
 Showing differences for columns product_category ,product_group ,product_subgroup ,product_subsubgroup ,unit
@@ -260,7 +266,7 @@ For the above reasons, a skew detection is done during the "count comparison" st
 ```
 Some important skew (threshold: %i) was detected in the Group By column x. The top values are:
 ```
-Following that message, the list of all the top 10 skewed values (and their number of apparitions) pops up so that a developer can know that he should avoid selecting that GroupBy column the next time he runs the program.
+Following that message, the list of all the top 10 skewed values (and their number of occurrences) pops up so that a developer can know that he should avoid selecting that GroupBy column the next time he runs the program.
 And it also gives the possibility to wonder if it is normal for this dataset to contain such skewed values.
 
 If the "count comparison" step has not encountered any error, but some skew has been discovered, then the program will also stop, with the following message:
