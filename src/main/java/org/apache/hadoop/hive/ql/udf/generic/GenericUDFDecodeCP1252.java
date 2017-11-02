@@ -43,7 +43,7 @@ public class GenericUDFDecodeCP1252 extends GenericUDF {
     private transient PrimitiveCategory[] inputTypes = new PrimitiveCategory[1];
     private transient Converter[] converters = new Converter[1];
     private final Text output = new Text();
-    private final Charset cp1252 = Charset.forName( "CP1252");
+    private final static Charset CP1252 = Charset.forName( "CP1252");
 
     @Override
     public ObjectInspector initialize(ObjectInspector[] arguments) throws UDFArgumentException {
@@ -61,42 +61,55 @@ public class GenericUDFDecodeCP1252 extends GenericUDF {
 
     @Override
     public Object evaluate(DeferredObject[] arguments) throws HiveException {
-        String val = getStringValue(arguments, 0, converters);
-        if (val == null) {
+        final String stringToDecode = getStringValue(arguments, 0, converters);
+        if (stringToDecode == null) {
             return null;
         }
 
-        char[] myCharArray = val.toCharArray();
-        byte[] bytesArray = new byte[1];
-        StringBuilder buf = new StringBuilder(myCharArray.length);
-        for (int i = 0; i < myCharArray.length; i++){
-            char ch = myCharArray[i];
-            if( Character.isISOControl( ch)){
-                int chint = (int)ch;
-                if( chint >= 1 && chint <= 9 ){
-                    buf.append(" ");    // those control characters are transformed to spaces by BigQuery
+        final char[] charactersToDecode = stringToDecode.toCharArray();
+        final byte[] bytesArray = new byte[1];
+        StringBuilder utf8_text = new StringBuilder(charactersToDecode.length);
+        for (int i = 0; i < charactersToDecode.length; i++){
+            char character = charactersToDecode[i];
+
+            if( Character.isISOControl( character)){  // encoding problems happened only with control characters
+                int asciiCode = (int)character;
+                if( asciiCode >= 1 && asciiCode <= 9 ){
+                    utf8_text.append(" ");    // those control characters are transformed to spaces by BigQuery
                 }
                 else {
-                    int codePoint = Character.codePointAt( myCharArray,i);
+                    int codePoint = Character.codePointAt( charactersToDecode,i);
+                    // First of all, let's handle the control characters that are transformed to space by BigQuery
+                    // (about those characters see: http://www.fileformat.info/info/unicode/char/0081/index.htm,
+                    // and http://www.ltg.ed.ac.uk/~richard/utf-8.cgi?input=129&mode=decimal
+                    // TODO add missing characters (so far I have just seen those 3)
                     if( codePoint == 129 || codePoint == 144 || codePoint == 157 ){
-                        buf.append(" ");    // those control character transformed to space by BigQuery
+                        utf8_text.append(" ");
                     }
                     else {
-                        String hexa = String.format("%02x", (int) ch); // this is where the control characters
-                        // (like \xc2 in \xc2\x99) are removed
-                        bytesArray[0] = (byte) ((Character.digit(hexa.charAt(0), 16) << 4)
-                                | Character.digit(hexa.charAt(1), 16));
+                        // this part tries to solve the cases like:
+                        // C299 (hex) CP1252 character being transformed by BigQuery into E284A2 (hex) in UTF8
+
+                        // first we need to get rid of the control character (in our example, we get rid of 'C2' and
+                        // we just keep '99')
+                        String last_2_hexa_bytes = String.format("%02x", (int) character);
+                        // gets the byte array from above "hexa string representation"
+                        // (solution extracted from https://stackoverflow.com/a/140861/4064443)
+                        bytesArray[0] = (byte) ((Character.digit(last_2_hexa_bytes.charAt(0), 16) << 4)
+                                | Character.digit(last_2_hexa_bytes.charAt(1), 16));
                         ByteBuffer wrappedBytes = ByteBuffer.wrap(bytesArray);
-                        String decodedString = cp1252.decode(wrappedBytes).toString();
-                        buf.append(decodedString);
+
+                        // now we can properly decode from CP1252 charset
+                        String decodedString = CP1252.decode(wrappedBytes).toString();
+                        utf8_text.append(decodedString);
                     }
                 }
             }
-            else{
-                buf.append(ch);
+            else{   // "standard" characters are OK. We just copied them "as is"
+                utf8_text.append(character);
             }
         }
-        output.set(buf.toString());
+        output.set(utf8_text.toString());
         return output;
     }
 
