@@ -238,7 +238,7 @@ This step won't usually make a huge difference in the execution time (it usually
 With this option, you might also be able to provide a better column that the one the script would have discovered by itself, which might speed up the following queries (by avoiding Skew for instance, see notes later).
 
 * with the `--just-count` option, you say that you just want to do a 'count rows validation'.
-This is some kind of "basic validation" because you won't be sure that the columns have some correct values.
+This is some kind of "basic validation" because you won't be sure that the contents of the rows have identical values.
 But that allows you to avoid the final "full SHAs validation" step, that is more expensive and timely to compute.
 And maybe this 'count' validation' is enough for you now, because you are at an early stage of development, and you don't need to be 100% sure of your data
 (checking the count of rows is also a good idea to double check if some JOINs or some Filters conditions work properly).
