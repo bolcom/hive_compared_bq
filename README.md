@@ -2,7 +2,7 @@
 
 hive_compared_bq is a Python program that compares 2 (SQL like) tables, and graphically shows the rows/columns that are different if any are found.
 
-Currently, there is no solution available on the internet that allows to compare the full content of some tables in a scalable way.
+Comparing the full content of some tables in a scalable way has proved to be a difficult task.
 
 hive_compared_bq tackles this problem by:
 * Not moving the data, avoiding long data transfer typically needed for a "Join compared" approach. Instead, only the aggregated data is moved.
